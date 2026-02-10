@@ -7,8 +7,6 @@ An [OpenCode](https://opencode.ai) plugin that implements two interlocking AI lo
 
 The combination lets you walk away from a task and come back to working code.
 
----
-
 ## How it works
 
 ### The outer loop (Ralph)
@@ -35,7 +33,6 @@ Each attempt the agent is required to:
 
 For tasks that can be decomposed, the agent can `subagent_spawn` a child session with an isolated goal. Each sub-agent gets its own state directory under `.opencode/agents/<name>/`. The parent polls with `subagent_await` and integrates the result.
 
----
 
 ## Install
 
@@ -66,7 +63,6 @@ OpenCode runs `bun install` at startup automatically.
 
 Copy the plugin to `~/.config/opencode/plugins/ralph-rlm.ts` and add the `package.json` to `~/.config/opencode/package.json`.
 
----
 
 ## Configuration
 
@@ -113,7 +109,6 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
 { "command": ["./scripts/verify.sh"] }
 ```
 
----
 
 ## Protocol files
 
@@ -132,7 +127,6 @@ The plugin bootstraps these files on first run if they do not exist. They are th
 
 Sub-agent state lives under `.opencode/agents/<name>/` with the same structure.
 
----
 
 ## Tools
 
@@ -196,7 +190,6 @@ Read any protocol file from a sub-agent's state directory without waiting for co
 
 List all sub-agents registered in the current session with their name, goal, status, and spawn time.
 
----
 
 ## Customising prompts via environment variables
 
@@ -250,7 +243,6 @@ You are working in a TypeScript monorepo. Rules:
 export RALPH_CONTINUE_PROMPT="@.opencode/prompts/continue.txt"
 ```
 
----
 
 ## Workflow patterns
 
@@ -289,7 +281,6 @@ Parent agent:
 
 Edit `RLM_INSTRUCTIONS.md` to add project-specific playbooks, register MCP tools, or adjust the debug workflow. Changes persist across attempts. Use `ralph_update_rlm_instructions()` from within a session, or edit the file directly.
 
----
 
 ## Hooks installed
 
@@ -301,7 +292,6 @@ Edit `RLM_INSTRUCTIONS.md` to add project-specific playbooks, register MCP tools
 | `experimental.session.compacting` | Injects protocol file pointers into compaction context so state survives context compression. |
 | `tool.execute.before` | Blocks destructive tools (`write`, `edit`, `bash`, `delete`, `move`, `rename`) until `ralph_load_context()` has been called. |
 
----
 
 ## Background
 
