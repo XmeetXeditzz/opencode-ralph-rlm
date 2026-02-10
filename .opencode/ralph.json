@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/your-org/ralph-rlm/main/schema.json",
+  "enabled": true,
+  "maxAttempts": 25,
+  "verify": {
+    "command": ["bun", "test"],
+    "cwd": "."
+  },
+  "gateDestructiveToolsUntilContextLoaded": true,
+  "maxRlmSliceLines": 200,
+  "requireGrepBeforeLargeSlice": true,
+  "grepRequiredThresholdLines": 120,
+  "subAgentEnabled": true,
+  "maxSubAgents": 5
+}
