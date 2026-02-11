@@ -8,6 +8,34 @@ This guide gets you from zero to a working Ralph + RLM loop quickly.
 - Start OpenCode in your repo.
 - Ensure `.opencode/ralph.json` exists (or run doctor in step 2).
 
+## 1.5) Understand the roles (supervisor vs Ralph vs worker)
+
+Ralph-RLM has three distinct layers so the agent behavior stays predictable:
+
+- **Supervisor (your current session):** Orchestrates the loop and responds to `ralph_ask()` questions. It should not implement code. It monitors progress and controls lifecycle (pause/resume/end).
+- **Ralph strategist (per-attempt):** A short-lived planning session created by the plugin. It reviews outcomes, updates `PLAN.md` / `RLM_INSTRUCTIONS.md`, then calls `ralph_spawn_worker()`.
+- **RLM worker (per-attempt):** A fresh coding session that does the actual edits, calls `ralph_verify()`, then stops.
+
+Think of it as: **Supervisor** (you) → **Ralph strategist** (planning) → **RLM worker** (implementation).
+
+### Quick mental model
+
+```
+Supervisor (you)
+  └─ Ralph strategist (attempt N)
+       └─ RLM worker (attempt N)
+            └─ ralph_verify()
+                ├─ pass → done
+                └─ fail → attempt N+1 (new Ralph + worker)
+```
+
+### Expected behavior checklist
+
+- Supervisor stays high-level (orchestration, decisions, answering `ralph_ask`).
+- Ralph strategist updates `PLAN.md` / `RLM_INSTRUCTIONS.md`, then spawns a worker.
+- Worker does the actual edits, calls `ralph_verify()`, then stops.
+- The loop continues until `verify.command` passes or `maxAttempts` is reached.
+
 ## 2) Bootstrap setup
 
 Run:
@@ -55,12 +83,22 @@ Use these to control behavior and delegation while keeping loop execution in the
 - Structured feed: `SUPERVISOR_LOG.md`
 - Human-readable timeline: `CONVERSATION.md`
 - Session questions: use `ralph_respond(id, answer)` when prompted by `ralph_ask()`
+- Quick peek (posts worker CURRENT_STATE into main conversation): `ralph_peek_worker()`
+
+### TUI navigation tips (seeing child sessions)
+
+- Cycle primary agents with Tab (OpenCode calls this `agent_cycle`).
+- If sub-agents spawn child sessions, cycle parent ⇄ child with:
+  - `<leader>+Right` (`session_child_cycle`)
+  - `<leader>+Left` (`session_child_cycle_reverse`)
+- Open the sessions list with `/sessions` (or `<leader>+l`) to jump between sessions.
+- Keybinds are configured in `opencode.json` (default leader is `ctrl+x`).
 
 ## 6) Control loop lifecycle
 
 - Pause without ending: `ralph_pause_supervision(reason?)`
 - Resume: `ralph_resume_supervision(start_loop?)`
-- Hard stop: `ralph_end_supervision(reason?, clear_binding?)`
+- Hard stop: `ralph_end_supervision(reason?, clear_binding?, delete_sessions?)`
 - Restart after stop/done: `ralph_create_supervisor_session(restart_if_done=true)`
 
 ## 7) Optional reviewer flow (gated)
@@ -88,6 +126,7 @@ Reviewer runtime state persists in `.opencode/reviewer_state.json`.
   "statusVerbosity": "normal",
   "maxAttempts": 25,
   "heartbeatMinutes": 15,
+  "verifyTimeoutMinutes": 15,
   "verify": { "command": ["bun", "run", "verify"], "cwd": "." },
   "gateDestructiveToolsUntilContextLoaded": true,
   "maxRlmSliceLines": 200,

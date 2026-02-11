@@ -105,6 +105,13 @@ Each session role has a distinct purpose and **fresh context window**:
 | **ralph** | Per-attempt strategist | Fresh | Review failure, update PLAN.md / RLM_INSTRUCTIONS.md, call `ralph_spawn_worker()`. |
 | **worker** | Per-attempt coder | Fresh | `ralph_load_context()` → code → `ralph_verify()` → stop. |
 
+### Roles and responsibilities (quick map)
+
+- **Supervisor (main session):** orchestration and decisions only. Never edits files or runs code; uses `ralph_*` tools to control lifecycle.
+- **Ralph strategist:** updates plan/instructions and delegates to a worker. No direct implementation.
+- **RLM worker:** does the actual coding and verification for this attempt. One pass per session.
+- **Sub-agent:** narrow task helper; updates its own state files under `.opencode/agents/<name>/`.
+
 ### The state machine
 
 ```
