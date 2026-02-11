@@ -3,3 +3,17 @@ dist/
 .opencode/tmp/
 *.diff
 .claude/
+
+# Ralph protocol runtime files (local loop state)
+AGENT_CONTEXT_FOR_NEXT_RALPH.md
+CONTEXT_FOR_RLM.md
+CONVERSATION.md
+CONVERSATION.*.md
+CURRENT_STATE.md
+NOTES_AND_LEARNINGS.md
+PLAN.md
+PREVIOUS_STATE.md
+RLM_INSTRUCTIONS.md
+SUPERVISOR_LOG.md
+TODOS.md
+.opencode/reviewer_state.json

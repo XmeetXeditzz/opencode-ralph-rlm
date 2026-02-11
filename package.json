@@ -14,6 +14,7 @@
   "scripts": {
     "build": "bun build .opencode/plugins/ralph-rlm.ts --outfile dist/ralph-rlm.js --target bun --format esm --external @opencode-ai/plugin",
     "typecheck": "tsc --noEmit",
+    "verify": "bun run typecheck && bun run build",
     "prepublishOnly": "bun run build",
     "release": "npm run release:patch",
     "release:patch": "npm version patch && git push --follow-tags",

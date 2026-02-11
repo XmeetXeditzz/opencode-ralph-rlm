@@ -1,9 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/your-org/ralph-rlm/main/schema.json",
   "enabled": true,
+  "autoStartOnMainIdle": false,
+  "statusVerbosity": "normal",
   "maxAttempts": 25,
+  "heartbeatMinutes": 15,
   "verify": {
-    "command": ["bun", "test"],
+    "command": ["bun", "run", "verify"],
     "cwd": "."
   },
   "gateDestructiveToolsUntilContextLoaded": true,
@@ -12,5 +15,12 @@
   "grepRequiredThresholdLines": 120,
   "subAgentEnabled": true,
   "maxSubAgents": 5,
+  "maxConversationLines": 1200,
+  "conversationArchiveCount": 3,
+  "reviewerEnabled": false,
+  "reviewerRequireExplicitReady": true,
+  "reviewerMaxRunsPerAttempt": 1,
+  "reviewerOutputDir": ".opencode/reviews",
+  "reviewerPostToConversation": true,
   "agentMdPath": "AGENT.md"
 }

@@ -62,6 +62,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin/tool";
 import * as NodePath from "path";
 import { promises as NodeFs } from "fs";
+import { spawn } from "child_process";
 import {
   Effect,
   Schema,
@@ -78,7 +79,10 @@ const VerifyConfigSchema = Schema.Struct({
 
 const RalphConfigSchema = Schema.Struct({
   enabled: Schema.optional(Schema.Boolean),
+  autoStartOnMainIdle: Schema.optional(Schema.Boolean),
+  statusVerbosity: Schema.optional(Schema.Union(Schema.Literal("minimal"), Schema.Literal("normal"), Schema.Literal("verbose"))),
   maxAttempts: Schema.optional(Schema.Number),
+  heartbeatMinutes: Schema.optional(Schema.Number),
   verify: Schema.optional(VerifyConfigSchema),
   gateDestructiveToolsUntilContextLoaded: Schema.optional(Schema.Boolean),
   maxRlmSliceLines: Schema.optional(Schema.Number),
@@ -86,6 +90,13 @@ const RalphConfigSchema = Schema.Struct({
   grepRequiredThresholdLines: Schema.optional(Schema.Number),
   subAgentEnabled: Schema.optional(Schema.Boolean),
   maxSubAgents: Schema.optional(Schema.Number),
+  maxConversationLines: Schema.optional(Schema.Number),
+  conversationArchiveCount: Schema.optional(Schema.Number),
+  reviewerEnabled: Schema.optional(Schema.Boolean),
+  reviewerRequireExplicitReady: Schema.optional(Schema.Boolean),
+  reviewerMaxRunsPerAttempt: Schema.optional(Schema.Number),
+  reviewerOutputDir: Schema.optional(Schema.String),
+  reviewerPostToConversation: Schema.optional(Schema.Boolean),
   /**
    * Path (relative to repo root) of the project AGENT.md file.
    * When set, ralph_load_context() reads it and includes its content in the
@@ -102,7 +113,10 @@ type RalphConfig = Schema.Schema.Type<typeof RalphConfigSchema>;
 
 type ResolvedConfig = {
   enabled: boolean;
+  autoStartOnMainIdle: boolean;
+  statusVerbosity: "minimal" | "normal" | "verbose";
   maxAttempts: number;
+  heartbeatMinutes: number;
   verify?: { command: string[]; cwd?: string };
   gateDestructiveToolsUntilContextLoaded: boolean;
   maxRlmSliceLines: number;
@@ -110,37 +124,99 @@ type ResolvedConfig = {
   grepRequiredThresholdLines: number;
   subAgentEnabled: boolean;
   maxSubAgents: number;
+  maxConversationLines: number;
+  conversationArchiveCount: number;
+  reviewerEnabled: boolean;
+  reviewerRequireExplicitReady: boolean;
+  reviewerMaxRunsPerAttempt: number;
+  reviewerOutputDir: string;
+  reviewerPostToConversation: boolean;
   /** Relative path to AGENT.md; empty string disables inclusion. */
   agentMdPath: string;
 };
 
+function toBoundedInt(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max = Number.MAX_SAFE_INTEGER
+): number {
+  const candidate = typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  const n = Math.trunc(candidate);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function sanitizeVerify(
+  verify: RalphConfig["verify"]
+): ResolvedConfig["verify"] {
+  if (!verify) return undefined;
+  const command = verify.command
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (command.length === 0) return undefined;
+  const cwd = verify.cwd?.trim();
+  return cwd ? { command, cwd } : { command };
+}
+
 const CONFIG_DEFAULTS: ResolvedConfig = {
   enabled: true,
+  autoStartOnMainIdle: false,
+  statusVerbosity: "normal",
   maxAttempts: 20,
+  heartbeatMinutes: 15,
   gateDestructiveToolsUntilContextLoaded: true,
   maxRlmSliceLines: 200,
   requireGrepBeforeLargeSlice: true,
   grepRequiredThresholdLines: 120,
   subAgentEnabled: true,
   maxSubAgents: 5,
+  maxConversationLines: 1200,
+  conversationArchiveCount: 3,
+  reviewerEnabled: false,
+  reviewerRequireExplicitReady: true,
+  reviewerMaxRunsPerAttempt: 1,
+  reviewerOutputDir: ".opencode/reviews",
+  reviewerPostToConversation: true,
   agentMdPath: "AGENT.md",
 };
 
 function resolveConfig(raw: RalphConfig): ResolvedConfig {
+  const verify = sanitizeVerify(raw.verify);
+  const maxRlmSliceLines = toBoundedInt(raw.maxRlmSliceLines, CONFIG_DEFAULTS.maxRlmSliceLines, 10, 2000);
+  const grepRequiredThresholdLines = toBoundedInt(
+    raw.grepRequiredThresholdLines,
+    CONFIG_DEFAULTS.grepRequiredThresholdLines,
+    1,
+    maxRlmSliceLines
+  );
+
   return {
     enabled: raw.enabled ?? CONFIG_DEFAULTS.enabled,
-    maxAttempts: raw.maxAttempts ?? CONFIG_DEFAULTS.maxAttempts,
-    ...(raw.verify !== undefined ? { verify: raw.verify as NonNullable<ResolvedConfig["verify"]> } : {}),
+    autoStartOnMainIdle: raw.autoStartOnMainIdle ?? CONFIG_DEFAULTS.autoStartOnMainIdle,
+    statusVerbosity: raw.statusVerbosity ?? CONFIG_DEFAULTS.statusVerbosity,
+    maxAttempts: toBoundedInt(raw.maxAttempts, CONFIG_DEFAULTS.maxAttempts, 1, 500),
+    heartbeatMinutes: toBoundedInt(raw.heartbeatMinutes, CONFIG_DEFAULTS.heartbeatMinutes, 1, 240),
+    ...(verify !== undefined
+      ? { verify: verify as NonNullable<ResolvedConfig["verify"]> }
+      : {}),
     gateDestructiveToolsUntilContextLoaded:
       raw.gateDestructiveToolsUntilContextLoaded ??
       CONFIG_DEFAULTS.gateDestructiveToolsUntilContextLoaded,
-    maxRlmSliceLines: raw.maxRlmSliceLines ?? CONFIG_DEFAULTS.maxRlmSliceLines,
+    maxRlmSliceLines,
     requireGrepBeforeLargeSlice:
       raw.requireGrepBeforeLargeSlice ?? CONFIG_DEFAULTS.requireGrepBeforeLargeSlice,
-    grepRequiredThresholdLines:
-      raw.grepRequiredThresholdLines ?? CONFIG_DEFAULTS.grepRequiredThresholdLines,
+    grepRequiredThresholdLines,
     subAgentEnabled: raw.subAgentEnabled ?? CONFIG_DEFAULTS.subAgentEnabled,
-    maxSubAgents: raw.maxSubAgents ?? CONFIG_DEFAULTS.maxSubAgents,
+    maxSubAgents: toBoundedInt(raw.maxSubAgents, CONFIG_DEFAULTS.maxSubAgents, 1, 50),
+    maxConversationLines: toBoundedInt(raw.maxConversationLines, CONFIG_DEFAULTS.maxConversationLines, 200, 20000),
+    conversationArchiveCount: toBoundedInt(raw.conversationArchiveCount, CONFIG_DEFAULTS.conversationArchiveCount, 1, 20),
+    reviewerEnabled: raw.reviewerEnabled ?? CONFIG_DEFAULTS.reviewerEnabled,
+    reviewerRequireExplicitReady:
+      raw.reviewerRequireExplicitReady ?? CONFIG_DEFAULTS.reviewerRequireExplicitReady,
+    reviewerMaxRunsPerAttempt: toBoundedInt(raw.reviewerMaxRunsPerAttempt, CONFIG_DEFAULTS.reviewerMaxRunsPerAttempt, 1, 20),
+    reviewerOutputDir: raw.reviewerOutputDir?.trim() || CONFIG_DEFAULTS.reviewerOutputDir,
+    reviewerPostToConversation: raw.reviewerPostToConversation ?? CONFIG_DEFAULTS.reviewerPostToConversation,
     agentMdPath: raw.agentMdPath ?? CONFIG_DEFAULTS.agentMdPath,
   };
 }
@@ -200,7 +276,7 @@ type PromptTemplates = {
   workerSystemPrompt: string;
   /**
    * Initial prompt sent to each spawned RLM worker session.
-   * Tokens: {{attempt}}
+   * Tokens: {{attempt}}, {{nextAttempt}}
    */
   workerPrompt: string;
   /**
@@ -225,7 +301,10 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "- After each worker attempt the plugin runs verify and either finishes or spawns the next worker.",
     "- Spawned sessions (Ralph strategist, RLM worker) may send questions via ralph_ask().",
     "  When you receive one, call ralph_respond(id, answer) to unblock the session.",
-    "- Monitor progress in SUPERVISOR_LOG.md or via toast notifications.",
+    "- Use ralph_doctor() to check setup, ralph_bootstrap_plan() to generate PLAN/TODOS,",
+    "  ralph_create_supervisor_session() to bind/start explicitly, ralph_pause_supervision()/ralph_resume_supervision() to control execution, and ralph_end_supervision() to stop.",
+    "- Optional reviewer flow: worker marks readiness with ralph_request_review(); supervisor runs ralph_run_reviewer().",
+    "- Monitor progress in SUPERVISOR_LOG.md, CONVERSATION.md, or via toast notifications.",
   ].join("\n"),
 
   systemPromptAppend: "",
@@ -238,6 +317,7 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "- CURRENT_STATE.md                — scratch for this attempt only",
     "- PREVIOUS_STATE.md               — snapshot of last attempt's scratch",
     "- NOTES_AND_LEARNINGS.md          — append-only durable learnings",
+    "- CONVERSATION.md                 — append-only supervisor-visible status feed",
     "- CONTEXT_FOR_RLM.md              — large reference; access via rlm_grep + rlm_slice",
     "- .opencode/agents/<name>/        — sub-agent state directories",
   ].join("\n"),
@@ -251,6 +331,7 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "- Use rlm_grep / rlm_slice for CONTEXT_FOR_RLM.md — never dump it whole.",
     "- CURRENT_STATE.md is scratch for this attempt; durable changes go to PLAN.md / NOTES_AND_LEARNINGS.md.",
     "- Sub-agents: subagent_spawn → subagent_await → integrate result.",
+    "- If verification is unknown or blocked by tooling, fix verify.command / scripts first.",
     "",
     "Objective: fix the failing verification. When fixed, call ralph_verify().",
   ].join("\n"),
@@ -293,6 +374,7 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "- CURRENT_STATE.md is scratch for this attempt only.",
     "- Update PLAN.md only for durable changes (milestone completed, new constraint).",
     "- Write durable learnings to NOTES_AND_LEARNINGS.md (append-only).",
+    "- Report meaningful progress with ralph_report() so the supervisor can track attempts in SUPERVISOR_LOG.md and CONVERSATION.md.",
     "- Modify these instructions via ralph_update_rlm_instructions(patch, reason).",
     "",
     "## Skills / MCP Registry (editable)",
@@ -337,6 +419,8 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "- CONTEXT_FOR_RLM.md is large. Access via rlm_grep + rlm_slice only. Never full-dump it.",
     "- CURRENT_STATE.md is scratch for this attempt. Write your progress here.",
     "- NOTES_AND_LEARNINGS.md is append-only. Write durable insights here.",
+    "- Send status updates with ralph_report() at start, after major milestones, and before ralph_verify().",
+    "- Optionally call ralph_set_status(running|blocked|done|error, note) for explicit state handoff.",
     "- When satisfied with your changes, call ralph_verify() once, then STOP.",
     "  The Ralph supervisor evaluates the result and will spawn the next attempt if needed.",
     "- Do NOT re-prompt yourself. One pass per session.",
@@ -349,8 +433,11 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "1. Call ralph_load_context() FIRST. It contains PLAN.md, RLM_INSTRUCTIONS.md, previous state, and all context.",
     "2. Read AGENT_CONTEXT_FOR_NEXT_RALPH.md for the verdict and next step from the previous attempt.",
     "3. Follow RLM_INSTRUCTIONS.md for project-specific playbooks.",
-    "4. Do the work. Write progress to CURRENT_STATE.md throughout.",
-    "5. When done, call ralph_verify(). Then STOP — do not send further messages.",
+    "4. Immediately call ralph_report() with your plan for this attempt.",
+    "5. Optionally call ralph_set_status('running', '...') once you've scoped the approach.",
+    "6. Do the work. Write progress to CURRENT_STATE.md throughout and call ralph_report() at meaningful checkpoints.",
+    "7. When done, call ralph_set_status('done', '...') and ralph_report() with outcome + remaining risks, then call ralph_verify().",
+    "8. STOP — do not send further messages.",
     "   The Ralph supervisor will handle the result and spawn attempt {{nextAttempt}} if needed.",
   ].join("\n"),
 
@@ -373,8 +460,10 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "3. Review PLAN.md — is the goal still correct? Any constraints to add?",
     "4. Optionally call ralph_update_plan() or ralph_update_rlm_instructions() to improve",
     "   guidance for the next worker based on patterns in the failures.",
-    "5. Call ralph_spawn_worker() to delegate the coding work to a fresh RLM worker.",
-    "6. STOP — the plugin handles verification and will spawn attempt {{nextAttempt}} if needed.",
+    "5. Optionally call ralph_set_status('running', 'strategy finalized').",
+    "6. Call ralph_report() summarizing strategy changes for this attempt.",
+    "7. Call ralph_spawn_worker() to delegate the coding work to a fresh RLM worker.",
+    "8. STOP — the plugin handles verification and will spawn attempt {{nextAttempt}} if needed.",
     "",
     "You do not write code. Your value is strategic context adjustment between attempts.",
   ].join("\n"),
@@ -414,7 +503,6 @@ async function loadPromptTemplates(worktree: string): Promise<PromptTemplates> {
     try {
       return await resolveEnvVar(raw, worktree);
     } catch (e) {
-      console.warn(`[ralph-rlm] Failed to load ${envKey}: ${e}. Using default.`);
       return defaultValue;
     }
   }
@@ -494,6 +582,7 @@ type SubAgentRecord = {
 };
 
 const PENDING_INPUT_PATH = ".opencode/pending_input.json";
+const REVIEWER_STATE_PATH = ".opencode/reviewer_state.json";
 
 type QuestionRecord = {
   id: string;
@@ -524,6 +613,52 @@ const writePendingInput = async (root: string, data: PendingInputData): Promise<
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
+async function runCommand(
+  command: string[],
+  cwd: string
+): Promise<{ ok: boolean; code: number | null; stdout: string; stderr: string }> {
+  return await new Promise((resolve) => {
+    const child = spawn(command[0] ?? "", command.slice(1), {
+      cwd,
+      env: process.env,
+      shell: false,
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    child.on("error", (err) => {
+      resolve({ ok: false, code: null, stdout, stderr: `${stderr}\n${String(err)}`.trim() });
+    });
+
+    child.on("close", (code) => {
+      resolve({ ok: code === 0, code, stdout, stderr });
+    });
+  });
+}
+
+type SetupDiagnostics = {
+  ready: boolean;
+  issues: string[];
+  warnings: string[];
+  suggestions: string[];
+};
+
+type PlanValidation = {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  suggestions: string[];
+};
+
 /**
  * The role of a spawned session within the Ralph+RLM hierarchy.
  *
@@ -551,6 +686,12 @@ type SessionState = {
   workerSpawned: boolean;
   lastGrepAt?: number | undefined;
   lastGrepQuery?: string | undefined;
+  /** Optional explicit progress marker reported by the session. */
+  reportedStatus?: "running" | "blocked" | "done" | "error" | undefined;
+  /** Optional human-readable note for reportedStatus. */
+  reportedStatusNote?: string | undefined;
+  /** Last time this session sent explicit progress/status. */
+  lastProgressAt?: number | undefined;
   /** Sub-agents spawned by this session (workers only). */
   subAgents: SubAgentRecord[];
 };
@@ -570,12 +711,32 @@ type SupervisorState = {
   currentWorkerSessionId?: string | undefined;
   /** True once verification has passed — stops the loop. */
   done: boolean;
+  /** Paused supervision: no automatic spawning while true. */
+  paused?: boolean | undefined;
   /** Debounce timestamp for main-session idle. */
   lastMainIdleAt?: number | undefined;
+  /** Per-attempt explicit review requests. */
+  reviewRequested: Record<number, string>;
+  /** Per-attempt reviewer run counter. */
+  reviewerRuns: Record<number, number>;
+  /** Active reviewer metadata if running. */
+  activeReviewerName?: string | undefined;
+  activeReviewerAttempt?: number | undefined;
+  activeReviewerSessionId?: string | undefined;
+  activeReviewerOutputPath?: string | undefined;
 };
 
 function freshSession(role: SessionRole = "main", attempt = 0): SessionState {
-  return { role, attempt, loadedContext: false, workerSpawned: false, subAgents: [] };
+  return {
+    role,
+    attempt,
+    loadedContext: false,
+    workerSpawned: false,
+    reportedStatus: undefined,
+    reportedStatusNote: undefined,
+    lastProgressAt: undefined,
+    subAgents: [],
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -653,6 +814,21 @@ function extractHeadings(md: string, max: number): string {
   return out.join("\n");
 }
 
+function regexFromQuery(query: string): RegExp {
+  const slashForm = query.match(/^\/(.*)\/([a-z]*)$/i);
+  if (slashForm) {
+    const [, pattern, flagsRaw] = slashForm;
+    const flags = Array.from(new Set((flagsRaw ?? "").split(""))).join("");
+    return new RegExp(pattern ?? "", flags.includes("i") ? flags : `${flags}i`);
+  }
+  try {
+    return new RegExp(query, "i");
+  } catch {
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(escaped, "i");
+  }
+}
+
 const DESTRUCTIVE_TOOLS = new Set(["write", "edit", "bash", "delete", "move", "rename"]);
 const SAFE_TOOLS = new Set([
   "ralph_load_context", "rlm_grep", "rlm_slice",
@@ -674,6 +850,7 @@ const FILES = {
   NOTES: "NOTES_AND_LEARNINGS.md",
   TODOS: "TODOS.md",
   SUPERVISOR_LOG: "SUPERVISOR_LOG.md",
+  CONVERSATION: "CONVERSATION.md",
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -728,6 +905,7 @@ const bootstrapProtocolFiles = (
         ensureFile(j(FILES.NOTES), `# Notes and Learnings (append-only)\n\n- ${ts} created\n`),
         ensureFile(j(FILES.TODOS), `# Todos\n\n- [ ] (optional)\n`),
         ensureFile(j(FILES.SUPERVISOR_LOG), `# Supervisor Log (append-only)\n\n- ${ts} created\n`),
+        ensureFile(j(FILES.CONVERSATION), `# Conversation Log (append-only)\n\n- ${ts} created\n`),
       ],
       { concurrency: "unbounded" }
     );
@@ -801,6 +979,22 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
   // ── Load prompt templates once at startup ───────────────────────────────────
   const templates = await loadPromptTemplates(worktree);
 
+  const appLog = async (
+    level: "debug" | "info" | "warn" | "error",
+    message: string,
+    extra?: Record<string, unknown>
+  ): Promise<void> => {
+    const body = {
+      service: "ralph-rlm",
+      level,
+      message,
+      ...(extra !== undefined ? { extra } : {}),
+    };
+    await client.app.log({
+      body,
+    }).catch(() => {});
+  };
+
   // ── Config cache — re-read at most once per 10 s to pick up live edits ──────
   // loadConfig() reads+parses a JSON file; calling it on every tool.execute.before
   // (which fires for every tool invocation) would hammer the filesystem.
@@ -815,7 +1009,57 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
     });
 
   // ── Supervisor state (singleton — lives in the main session's plugin process) ─
-  const supervisor: SupervisorState = { attempt: 0, done: false };
+  const supervisor: SupervisorState = {
+    attempt: 0,
+    done: false,
+    paused: false,
+    reviewRequested: {},
+    reviewerRuns: {},
+  };
+
+  const loadReviewerState = async (): Promise<void> => {
+    try {
+      const raw = await NodeFs.readFile(NodePath.join(worktree, REVIEWER_STATE_PATH), "utf8");
+      const parsed = JSON.parse(raw) as {
+        reviewRequested?: Record<string, string>;
+        reviewerRuns?: Record<string, number>;
+        activeReviewerName?: string;
+        activeReviewerAttempt?: number;
+        activeReviewerSessionId?: string;
+        activeReviewerOutputPath?: string;
+      };
+
+      supervisor.reviewRequested = Object.fromEntries(
+        Object.entries(parsed.reviewRequested ?? {}).map(([k, v]) => [Number(k), String(v)])
+      );
+      supervisor.reviewerRuns = Object.fromEntries(
+        Object.entries(parsed.reviewerRuns ?? {}).map(([k, v]) => [Number(k), Number(v)])
+      );
+      supervisor.activeReviewerName = parsed.activeReviewerName;
+      supervisor.activeReviewerAttempt = parsed.activeReviewerAttempt;
+      supervisor.activeReviewerSessionId = parsed.activeReviewerSessionId;
+      supervisor.activeReviewerOutputPath = parsed.activeReviewerOutputPath;
+    } catch {
+      // no-op: missing or invalid file means empty reviewer state
+    }
+  };
+
+  const persistReviewerState = async (): Promise<void> => {
+    const p = NodePath.join(worktree, REVIEWER_STATE_PATH);
+    const payload = {
+      reviewRequested: supervisor.reviewRequested,
+      reviewerRuns: supervisor.reviewerRuns,
+      activeReviewerName: supervisor.activeReviewerName,
+      activeReviewerAttempt: supervisor.activeReviewerAttempt,
+      activeReviewerSessionId: supervisor.activeReviewerSessionId,
+      activeReviewerOutputPath: supervisor.activeReviewerOutputPath,
+      updatedAt: nowISO(),
+    };
+    await NodeFs.mkdir(NodePath.dirname(p), { recursive: true });
+    await NodeFs.writeFile(p, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  };
+
+  await loadReviewerState();
 
   // ── Session state (workers + sub-agents) ────────────────────────────────────
   const sessionMap = new Map<string, SessionState>();
@@ -839,6 +1083,211 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
     bootstrapProtocolFiles(worktree, templates).pipe(Effect.orElse(() => Effect.void))
   );
 
+  const messagePassesVerbosity = (
+    verbosity: ResolvedConfig["statusVerbosity"],
+    level: "info" | "warning" | "error"
+  ): boolean => {
+    if (verbosity === "verbose") return true;
+    if (verbosity === "minimal") return level !== "info";
+    return true;
+  };
+
+  const rotateConversationLogIfNeeded = async (cfg: ResolvedConfig): Promise<void> => {
+    const convPath = NodePath.join(worktree, FILES.CONVERSATION);
+    const exists = await run(fileExists(convPath));
+    if (!exists) return;
+
+    const raw = await run(readFile(convPath).pipe(Effect.orElseSucceed(() => "")));
+    const lines = raw.split(/\r?\n/);
+    if (lines.length <= cfg.maxConversationLines) return;
+
+    for (let i = cfg.conversationArchiveCount; i >= 1; i--) {
+      const curr = NodePath.join(worktree, `CONVERSATION.${i}.md`);
+      if (i === cfg.conversationArchiveCount) {
+        await NodeFs.rm(curr, { force: true }).catch(() => {});
+        continue;
+      }
+      const next = NodePath.join(worktree, `CONVERSATION.${i + 1}.md`);
+      const ok = await NodeFs.stat(curr).then(() => true).catch(() => false);
+      if (ok) {
+        await NodeFs.rm(next, { force: true }).catch(() => {});
+        await NodeFs.rename(curr, next).catch(() => {});
+      }
+    }
+
+    await NodeFs.rename(convPath, NodePath.join(worktree, "CONVERSATION.1.md")).catch(() => {});
+    await run(writeFile(convPath, `# Conversation Log (append-only)\n\n- ${nowISO()} rotated\n`)).catch(() => {});
+  };
+
+  const appendConversationEntry = async (
+    source: string,
+    message: string
+  ): Promise<void> => {
+    const cfg = await run(getConfig());
+    await rotateConversationLogIfNeeded(cfg);
+    const ts = nowISO();
+    const line = `- [${ts}] [${source}] ${message}\n`;
+    await run(appendFile(NodePath.join(worktree, FILES.CONVERSATION), line)).catch((err: unknown) => {
+      void appLog("warn", "failed to append CONVERSATION.md", { error: String(err) });
+    });
+  };
+
+  const notifySupervisor = async (
+    source: string,
+    message: string,
+    level: "info" | "warning" | "error" = "info",
+    postToConversation = true,
+    originSessionId?: string
+  ): Promise<void> => {
+    const cfg = await run(getConfig());
+    if (!messagePassesVerbosity(cfg.statusVerbosity, level)) return;
+
+    const ts = nowISO();
+    const logLine = `- [${ts}][${level.toUpperCase()}][${source}] ${message}\n`;
+    await run(appendFile(NodePath.join(worktree, FILES.SUPERVISOR_LOG), logLine)).catch((err: unknown) => {
+      void appLog("warn", "failed to append SUPERVISOR_LOG.md", { error: String(err) });
+    });
+    await appendConversationEntry(source, message);
+
+    await client.tui.showToast({
+      body: {
+        variant: level,
+        title: `Ralph [${source}]`,
+        message: message.slice(0, 120),
+      },
+    }).catch(() => {});
+
+    if (postToConversation && supervisor.sessionId && supervisor.sessionId !== originSessionId) {
+      await client.session.promptAsync({
+        path: { id: supervisor.sessionId },
+        body: { parts: [{ type: "text", text: `[${source}] ${message}` }] },
+      }).catch(() => {});
+    }
+  };
+
+  const checkSetup = async (root: string, cfg: ResolvedConfig): Promise<SetupDiagnostics> => {
+    const diagnostics: SetupDiagnostics = {
+      ready: true,
+      issues: [],
+      warnings: [],
+      suggestions: [],
+    };
+    const j = (f: string) => NodePath.join(root, f);
+
+    if (!cfg.verify || cfg.verify.command.length === 0) {
+      diagnostics.ready = false;
+      diagnostics.issues.push("Missing verify.command in .opencode/ralph.json.");
+      diagnostics.suggestions.push("Set verify.command, e.g. [\"bun\", \"run\", \"verify\"].");
+    }
+
+    const planExists = await run(fileExists(j(FILES.PLAN)));
+    if (!planExists) {
+      diagnostics.ready = false;
+      diagnostics.issues.push("Missing PLAN.md.");
+      diagnostics.suggestions.push("Run ralph_bootstrap_plan() or create PLAN.md manually.");
+    } else {
+      const planRaw = await run(readFile(j(FILES.PLAN)).pipe(Effect.orElseSucceed(() => "")));
+      if (planRaw.includes("(fill in)")) {
+        diagnostics.warnings.push("PLAN.md still contains placeholders.");
+        diagnostics.suggestions.push("Use ralph_bootstrap_plan() to define goals, milestones, and stopping conditions.");
+      }
+    }
+
+    if (cfg.agentMdPath && cfg.agentMdPath.trim().length > 0) {
+      const agentMdExists = await run(fileExists(j(cfg.agentMdPath)));
+      if (!agentMdExists) {
+        diagnostics.warnings.push(`${cfg.agentMdPath} is missing.`);
+        diagnostics.suggestions.push("Create AGENT.md with static project rules to improve consistency across attempts.");
+      }
+    }
+
+    return diagnostics;
+  };
+
+  const renderPlan = (input: {
+    goal: string;
+    requirements: string[];
+    stoppingConditions: string[];
+    features: string[];
+    steps: string[];
+  }): string => {
+    const ts = nowISO();
+    const req = input.requirements.length ? input.requirements : ["(none specified)"];
+    const stop = input.stoppingConditions.length ? input.stoppingConditions : ["Verification command passes."];
+    const feats = input.features.length ? input.features : ["(none specified)"];
+    const steps = input.steps.length
+      ? input.steps.map((s) => `- [ ] ${s}`)
+      : ["- [ ] Break work into milestones", "- [ ] Implement", "- [ ] Verify"];
+
+    return [
+      "# Plan",
+      "",
+      "## Goal",
+      input.goal,
+      "",
+      "## Requirements",
+      ...req.map((r) => `- ${r}`),
+      "",
+      "## Features",
+      ...feats.map((f) => `- ${f}`),
+      "",
+      "## Definition of Done",
+      ...stop.map((s) => `- ${s}`),
+      "",
+      "## Milestones",
+      ...steps,
+      "",
+      "## Changelog",
+      `- ${ts} generated by ralph_bootstrap_plan`,
+      "",
+    ].join("\n");
+  };
+
+  const validatePlanContent = (plan: string): PlanValidation => {
+    const hasGoal = /(^|\n)##\s+Goal\b/i.test(plan);
+    const hasRequirements = /(^|\n)##\s+Requirements\b/i.test(plan);
+    const hasDone = /(^|\n)##\s+(Definition\s+of\s+Done|Stopping\s+Conditions)\b/i.test(plan);
+    const hasMilestones = /(^|\n)##\s+(Milestones|Steps)\b/i.test(plan);
+    const hasChecklist = /-\s+\[\s?[xX ]\s?\]/.test(plan);
+
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const suggestions: string[] = [];
+
+    if (!hasGoal) errors.push("PLAN.md is missing a '## Goal' section.");
+    if (!hasRequirements) errors.push("PLAN.md is missing a '## Requirements' section.");
+    if (!hasDone) errors.push("PLAN.md is missing stopping conditions / definition of done.");
+    if (!hasMilestones) warnings.push("PLAN.md is missing a milestones/steps section.");
+    if (hasMilestones && !hasChecklist) warnings.push("Milestones exist but no checklist items were found.");
+    if (plan.includes("(none specified)")) {
+      warnings.push("PLAN.md still contains '(none specified)' placeholders.");
+      suggestions.push("Replace placeholders with concrete requirements/features before long runs.");
+    }
+
+    if (errors.length === 0 && warnings.length === 0) {
+      suggestions.push("Plan structure looks healthy.");
+    }
+
+    return { ok: errors.length === 0, errors, warnings, suggestions };
+  };
+
+  const markReviewRequested = (attempt: number, note: string): void => {
+    supervisor.reviewRequested[attempt] = note;
+    void persistReviewerState();
+  };
+
+  const clearReviewRequested = (attempt: number): void => {
+    delete supervisor.reviewRequested[attempt];
+    void persistReviewerState();
+  };
+
+  const getReviewerRuns = (attempt: number): number => supervisor.reviewerRuns[attempt] ?? 0;
+
+  const incReviewerRuns = (attempt: number): void => {
+    supervisor.reviewerRuns[attempt] = getReviewerRuns(attempt) + 1;
+    void persistReviewerState();
+  };
+
   // ── Inline verify (shared between tool and outer loop) ──────────────────────
   const runVerify = (root: string): Effect.Effect<string> =>
     Effect.gen(function* () {
@@ -854,18 +1303,27 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       const cwd = NodePath.join(root, cfg.verify.cwd ?? ".");
       return yield* Effect.tryPromise({
         try: async () => {
-          const output = await $({ cwd })`${verifyCmd}`.text();
-          return JSON.stringify({ verdict: "pass", output }, null, 2);
+          const result = await runCommand(verifyCmd, cwd);
+          if (result.ok) {
+            return JSON.stringify({ verdict: "pass", output: result.stdout }, null, 2);
+          }
+          return JSON.stringify(
+            {
+              verdict: "fail",
+              output: result.stdout,
+              error: result.stderr,
+              exitCode: result.code,
+            },
+            null,
+            2
+          );
         },
-        catch: (err: any) =>
+        catch: (err: unknown) =>
           JSON.stringify(
             {
               verdict: "fail",
-              output: typeof err?.stdout === "string" ? err.stdout : "",
-              error:
-                typeof err?.stderr === "string"
-                  ? err.stderr
-                  : (err?.message ?? String(err)),
+              output: "",
+              error: err instanceof Error ? err.message : String(err),
             },
             null,
             2
@@ -909,7 +1367,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
         Effect.gen(function* () {
           const agentMdAbs = cfg.agentMdPath ? j(cfg.agentMdPath) : null;
 
-          const [plan, rlmInstr, nextRalph, curr, prev, notes, todos, rlmRaw, agentMd] =
+          const [plan, rlmInstr, nextRalph, curr, prev, notes, todos, conversation, rlmRaw, agentMd] =
             yield* Effect.all(
               [
                 readFile(j(FILES.PLAN)).pipe(Effect.orElseSucceed(() => "(missing — create PLAN.md)")),
@@ -919,6 +1377,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
                 readFile(j(FILES.PREV)).pipe(Effect.orElseSucceed(() => "(none yet)")),
                 readFile(j(FILES.NOTES)).pipe(Effect.orElseSucceed(() => "(empty)")),
                 readFile(j(FILES.TODOS)).pipe(Effect.orElseSucceed(() => "(empty)")),
+                readFile(j(FILES.CONVERSATION)).pipe(Effect.orElseSucceed(() => "(empty)")),
                 readFile(j(FILES.RLM_CTX)).pipe(Effect.orElseSucceed(() => "")),
                 agentMdAbs
                   ? readFile(agentMdAbs).pipe(Effect.orElseSucceed(() => null as string | null))
@@ -941,6 +1400,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
             previous_state: prev,
             notes_and_learnings: clampLines(notes, 200),
             todos: clampLines(todos, 200),
+            conversation_log: clampLines(conversation, 200),
             context_for_rlm: {
               path: FILES.RLM_CTX,
               headings: rlmContext,
@@ -1003,14 +1463,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
           const raw = yield* readFile(fileAbs);
           const lines = raw.split(/\r?\n/);
 
-          let re: RegExp;
-          try {
-            re = new RegExp(args.query, "i");
-          } catch {
-            throw new Error(
-              `Invalid regex pattern: ${args.query}. Use a valid JavaScript regex or a plain search string.`
-            );
-          }
+          const re = regexFromQuery(args.query);
 
           const ctx_ = args.contextLines ?? 0;
           const maxM = args.maxMatches ?? 50;
@@ -1280,6 +1733,10 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       });
       const childSessionId: string = childSessionResult.data?.id ?? `unknown-${Date.now()}`;
 
+      // Register child role before first prompt so prompt routing/gating applies.
+      sessionMap.set(childSessionId, freshSession("subagent", st.attempt));
+      mutateSession(childSessionId, (s) => { s.lastProgressAt = Date.now(); });
+
       await client.session.prompt({
         path: { id: childSessionId },
         body: { parts: [{ type: "text", text: promptText }] },
@@ -1383,7 +1840,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
   // ────────────────────────────────────────────────────────────────────────────
   const tool_ralph_report = tool({
     description:
-      "Report progress to the supervisor. Appends to SUPERVISOR_LOG.md, shows a toast, and optionally posts a message to the main conversation.",
+      "Report progress to the supervisor. Appends to SUPERVISOR_LOG.md and CONVERSATION.md, shows a toast, and optionally posts a message to the main conversation.",
     args: {
       message: tool.schema.string().describe("Progress message to report."),
       level: tool.schema
@@ -1396,33 +1853,68 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
         .describe("Whether to post to the main conversation (default: true)."),
     },
     async execute(args, ctx) {
-      const root = ctx.worktree ?? worktree;
       const sessionID = ctx.sessionID ?? "default";
       const st = getSession(sessionID);
+      mutateSession(sessionID, (s) => { s.lastProgressAt = Date.now(); });
       const level = args.level ?? "info";
-      const ts = nowISO();
       const roleTag = `${st.role}/attempt-${st.attempt}`;
-      const logLine = `- [${ts}][${level.toUpperCase()}][${roleTag}] ${args.message}\n`;
-
-      await run(appendFile(NodePath.join(root, FILES.SUPERVISOR_LOG), logLine));
-
-      await client.tui.showToast({
-        body: {
-          variant: level,
-          title: `Ralph [${roleTag}]`,
-          message: args.message.slice(0, 120),
-        },
-      }).catch(() => {});
-
       const postToConv = args.post_to_conversation !== false;
-      if (postToConv && supervisor.sessionId && supervisor.sessionId !== sessionID) {
-        await client.session.promptAsync({
-          path: { id: supervisor.sessionId },
-          body: { parts: [{ type: "text", text: `[${roleTag}]: ${args.message}` }] },
-        }).catch(() => {});
-      }
+      await notifySupervisor(roleTag, args.message, level, postToConv, sessionID);
 
       return `Reported: ${args.message}`;
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_set_status
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_set_status = tool({
+    description:
+      "Set an explicit attempt status (running/blocked/done/error). Optional but useful for supervisor visibility and handoffs.",
+    args: {
+      status: tool.schema
+        .enum(["running", "blocked", "done", "error"] as const)
+        .describe("Status for the current role/attempt."),
+      note: tool.schema
+        .string()
+        .optional()
+        .describe("Optional short note with context."),
+      post_to_conversation: tool.schema
+        .boolean()
+        .optional()
+        .describe("Whether to post this status into the main conversation (default: true)."),
+    },
+    async execute(args, ctx) {
+      const sessionID = ctx.sessionID ?? "default";
+      const st = getSession(sessionID);
+      const roleTag = `${st.role}/attempt-${st.attempt}`;
+
+      mutateSession(sessionID, (s) => {
+        s.reportedStatus = args.status;
+        s.reportedStatusNote = args.note;
+        s.lastProgressAt = Date.now();
+      });
+
+      const level: "info" | "warning" | "error" =
+        args.status === "error" ? "error" : args.status === "blocked" ? "warning" : "info";
+
+      const msg = args.note
+        ? `Status set to ${args.status}: ${args.note}`
+        : `Status set to ${args.status}.`;
+
+      await notifySupervisor(roleTag, msg, level, args.post_to_conversation !== false, sessionID);
+
+      return JSON.stringify(
+        {
+          ok: true,
+          role: st.role,
+          attempt: st.attempt,
+          status: args.status,
+          note: args.note ?? null,
+        },
+        null,
+        2
+      );
     },
   });
 
@@ -1462,6 +1954,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       };
       data.questions.push(record);
       await writePendingInput(root, data);
+      await appendConversationEntry(roleTag, `Question (${id}): ${args.question}`);
 
       await client.tui.showToast({
         body: {
@@ -1520,17 +2013,825 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
         // Already answered — overwrite and note it.
         data.responses[args.id] = { answer: args.answer, respondedAt: nowISO() };
         await writePendingInput(root, data);
+        await appendConversationEntry("supervisor", `Updated response (${args.id}): ${args.answer}`);
         return `Response updated for question ${args.id} (was already answered; new answer overwrites old).`;
       }
       data.responses[args.id] = { answer: args.answer, respondedAt: nowISO() };
       await writePendingInput(root, data);
+      await appendConversationEntry("supervisor", `Response (${args.id}): ${args.answer}`);
       return `Response recorded for question ${args.id}.`;
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_doctor
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_doctor = tool({
+    description:
+      "Check Ralph/RLM setup readiness (config + files). Optionally apply safe autofixes.",
+    args: {
+      autofix: tool.schema
+        .boolean()
+        .optional()
+        .describe("Create missing baseline setup files and defaults when possible."),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const cfg = await run(getConfig());
+      const diagnosticsBefore = await checkSetup(root, cfg);
+      const actions: string[] = [];
+
+      if (args.autofix) {
+        const configPath = NodePath.join(root, ".opencode", "ralph.json");
+        const configExists = await run(fileExists(configPath));
+        if (!configExists) {
+          const defaultCfg = {
+            enabled: true,
+            autoStartOnMainIdle: false,
+            statusVerbosity: "normal",
+            maxAttempts: 25,
+            heartbeatMinutes: 15,
+            verify: { command: ["bun", "run", "verify"], cwd: "." },
+            gateDestructiveToolsUntilContextLoaded: true,
+            maxRlmSliceLines: 200,
+            requireGrepBeforeLargeSlice: true,
+            grepRequiredThresholdLines: 120,
+            subAgentEnabled: true,
+            maxSubAgents: 5,
+            maxConversationLines: 1200,
+            conversationArchiveCount: 3,
+            reviewerEnabled: false,
+            reviewerRequireExplicitReady: true,
+            reviewerMaxRunsPerAttempt: 1,
+            reviewerOutputDir: ".opencode/reviews",
+            reviewerPostToConversation: true,
+            agentMdPath: "AGENT.md",
+          };
+          await run(writeFile(configPath, `${JSON.stringify(defaultCfg, null, 2)}\n`));
+          _configCache = null;
+          actions.push("Created .opencode/ralph.json with safe defaults.");
+        }
+
+        const agentMdPath = NodePath.join(root, "AGENT.md");
+        const agentMdExists = await run(fileExists(agentMdPath));
+        if (!agentMdExists) {
+          const agentMd = [
+            "# Project Agent Rules",
+            "",
+            "## Build and verify",
+            "- Install: bun install",
+            "- Verify: bun run verify",
+            "",
+            "## Loop note",
+            "- This project uses ralph-rlm.",
+            "- Keep static rules in AGENT.md and attempt-specific strategy in RLM_INSTRUCTIONS.md.",
+            "",
+          ].join("\n");
+          await run(writeFile(agentMdPath, agentMd));
+          actions.push("Created AGENT.md baseline guidance.");
+        }
+      }
+
+      const diagnosticsAfter = await checkSetup(root, await run(getConfig()));
+      return JSON.stringify(
+        {
+          ok: diagnosticsAfter.ready,
+          before: diagnosticsBefore,
+          actions,
+          after: diagnosticsAfter,
+          hint: diagnosticsAfter.ready
+            ? "Setup is ready. Start with ralph_create_supervisor_session() or let auto-start run on idle."
+            : "Run ralph_bootstrap_plan() and fix issues listed above.",
+        },
+        null,
+        2
+      );
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_bootstrap_plan
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_bootstrap_plan = tool({
+    description:
+      "Generate PLAN.md and TODOS.md from goals/requirements/features/stopping conditions.",
+    args: {
+      goal: tool.schema.string().describe("Primary project goal."),
+      requirements: tool.schema.array(tool.schema.string()).optional(),
+      stopping_conditions: tool.schema.array(tool.schema.string()).optional(),
+      features: tool.schema.array(tool.schema.string()).optional(),
+      steps: tool.schema.array(tool.schema.string()).optional(),
+      todos: tool.schema.array(tool.schema.string()).optional(),
+      overwrite_plan: tool.schema.boolean().optional(),
+      overwrite_todos: tool.schema.boolean().optional(),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const planPath = NodePath.join(root, FILES.PLAN);
+      const todosPath = NodePath.join(root, FILES.TODOS);
+
+      const planExists = await run(fileExists(planPath));
+      if (planExists && args.overwrite_plan !== true) {
+        throw new Error("PLAN.md already exists. Set overwrite_plan=true to replace it.");
+      }
+
+      const plan = renderPlan({
+        goal: args.goal,
+        requirements: args.requirements ?? [],
+        stoppingConditions: args.stopping_conditions ?? [],
+        features: args.features ?? [],
+        steps: args.steps ?? [],
+      });
+      await run(writeFile(planPath, plan));
+
+      const todosExists = await run(fileExists(todosPath));
+      if (!todosExists || args.overwrite_todos === true) {
+        const items = (args.todos ?? args.steps ?? []).map((t) => `- [ ] ${t}`);
+        const body = [
+          "# Todos",
+          "",
+          ...(items.length ? items : ["- [ ] (optional)"]),
+          "",
+        ].join("\n");
+        await run(writeFile(todosPath, body));
+      }
+
+      await appendConversationEntry("supervisor", `Plan bootstrapped for goal: ${args.goal}`);
+      return "PLAN.md and TODOS.md updated.";
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_create_supervisor_session
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_create_supervisor_session = tool({
+    description:
+      "Bind current session as supervisor and optionally start attempt 1 immediately.",
+    args: {
+      start_loop: tool.schema.boolean().optional(),
+      force_rebind: tool.schema.boolean().optional(),
+      restart_if_done: tool.schema
+        .boolean()
+        .optional()
+        .describe("If supervision is done/stopped, reset state to allow a new run."),
+    },
+    async execute(args, ctx) {
+      const sessionID = ctx.sessionID ?? "default";
+      const root = ctx.worktree ?? worktree;
+      const cfg = await run(getConfig());
+
+      if (supervisor.sessionId && supervisor.sessionId !== sessionID && args.force_rebind !== true) {
+        return JSON.stringify(
+          {
+            ok: false,
+            message: `Supervisor is already bound to session ${supervisor.sessionId}. Set force_rebind=true to take over.`,
+          },
+          null,
+          2
+        );
+      }
+
+      supervisor.sessionId = sessionID;
+      supervisor.paused = false;
+      await notifySupervisor("supervisor", "Supervisor bound via tool call.", "info", false, sessionID);
+
+      const diagnostics = await checkSetup(root, cfg);
+      if (!diagnostics.ready) {
+        await notifySupervisor(
+          "supervisor",
+          "Setup is not ready. Run ralph_doctor(autofix=true) and ralph_bootstrap_plan().",
+          "warning",
+          true,
+          sessionID
+        );
+        return JSON.stringify({ ok: false, diagnostics }, null, 2);
+      }
+
+      const shouldStart = args.start_loop ?? true;
+      if (!shouldStart) {
+        return JSON.stringify({ ok: true, started: false, diagnostics }, null, 2);
+      }
+
+      if (supervisor.done && args.restart_if_done === true) {
+        supervisor.done = false;
+        supervisor.paused = false;
+        supervisor.currentRalphSessionId = undefined;
+        supervisor.currentWorkerSessionId = undefined;
+        supervisor.activeReviewerName = undefined;
+        supervisor.activeReviewerAttempt = undefined;
+        supervisor.activeReviewerSessionId = undefined;
+        supervisor.activeReviewerOutputPath = undefined;
+        await persistReviewerState();
+        await notifySupervisor("supervisor", "Supervisor done-state reset for a new run.", "info", true, sessionID);
+      }
+
+      if (supervisor.currentRalphSessionId || supervisor.currentWorkerSessionId || supervisor.done) {
+        return JSON.stringify(
+          {
+            ok: true,
+            started: false,
+            message: "Loop is already running or completed for this process.",
+            currentRalphSessionId: supervisor.currentRalphSessionId,
+            currentWorkerSessionId: supervisor.currentWorkerSessionId,
+            done: supervisor.done,
+          },
+          null,
+          2
+        );
+      }
+
+      supervisor.attempt = 1;
+      await notifySupervisor("supervisor", "Starting Ralph loop at attempt 1 (manual start).", "info", true, sessionID);
+      await spawnRalphSession(1);
+      return JSON.stringify({ ok: true, started: true, attempt: 1 }, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_end_supervision
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_end_supervision = tool({
+    description:
+      "Stop Ralph supervision for this process. Prevents further auto-loop orchestration until restarted.",
+    args: {
+      reason: tool.schema.string().optional().describe("Optional reason for ending supervision."),
+      clear_binding: tool.schema
+        .boolean()
+        .optional()
+        .describe("Clear supervisor session binding after stop (default false)."),
+    },
+    async execute(args, ctx) {
+      const sessionID = ctx.sessionID ?? "default";
+      const reason = args.reason?.trim();
+
+      supervisor.done = true;
+      supervisor.paused = true;
+      supervisor.currentRalphSessionId = undefined;
+      supervisor.currentWorkerSessionId = undefined;
+      supervisor.activeReviewerName = undefined;
+      supervisor.activeReviewerAttempt = undefined;
+      supervisor.activeReviewerSessionId = undefined;
+      supervisor.activeReviewerOutputPath = undefined;
+      await persistReviewerState();
+
+      if (args.clear_binding === true) {
+        supervisor.sessionId = undefined;
+      }
+
+      await notifySupervisor(
+        "supervisor",
+        reason
+          ? `Supervision ended. Reason: ${reason}`
+          : "Supervision ended by user request.",
+        "warning",
+        true,
+        sessionID
+      );
+
+      return JSON.stringify(
+        {
+          ok: true,
+          done: supervisor.done,
+          clearedBinding: args.clear_binding === true,
+          note: "Use ralph_create_supervisor_session(restart_if_done=true) to start again.",
+        },
+        null,
+        2
+      );
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_supervision_status
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_supervision_status = tool({
+    description:
+      "Get current supervision state (binding, attempt, active strategist/worker, done flag).",
+    args: {},
+    async execute(_args, _ctx) {
+      return JSON.stringify(
+        {
+          supervisor: {
+            sessionId: supervisor.sessionId ?? null,
+            attempt: supervisor.attempt,
+            done: supervisor.done,
+            paused: supervisor.paused ?? false,
+            currentRalphSessionId: supervisor.currentRalphSessionId ?? null,
+            currentWorkerSessionId: supervisor.currentWorkerSessionId ?? null,
+            activeReviewerName: supervisor.activeReviewerName ?? null,
+            activeReviewerAttempt: supervisor.activeReviewerAttempt ?? null,
+            activeReviewerSessionId: supervisor.activeReviewerSessionId ?? null,
+            activeReviewerOutputPath: supervisor.activeReviewerOutputPath ?? null,
+            reviewRequested: supervisor.reviewRequested,
+            reviewerRuns: supervisor.reviewerRuns,
+            lastMainIdleAt: supervisor.lastMainIdleAt ?? null,
+          },
+        },
+        null,
+        2
+      );
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_pause_supervision
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_pause_supervision = tool({
+    description: "Pause automatic Ralph orchestration without ending supervision.",
+    args: {
+      reason: tool.schema.string().optional().describe("Optional pause reason."),
+    },
+    async execute(args, ctx) {
+      const sessionID = ctx.sessionID ?? "default";
+      supervisor.paused = true;
+      await notifySupervisor(
+        "supervisor",
+        args.reason ? `Supervision paused: ${args.reason}` : "Supervision paused.",
+        "warning",
+        true,
+        sessionID
+      );
+      return JSON.stringify({ ok: true, paused: true }, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_resume_supervision
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_resume_supervision = tool({
+    description: "Resume supervision after pause. Optionally start loop immediately.",
+    args: {
+      start_loop: tool.schema.boolean().optional(),
+    },
+    async execute(args, ctx) {
+      const sessionID = ctx.sessionID ?? "default";
+      if (!supervisor.sessionId) supervisor.sessionId = sessionID;
+      supervisor.paused = false;
+      await notifySupervisor("supervisor", "Supervision resumed.", "info", true, sessionID);
+
+      const shouldStart = args.start_loop ?? false;
+      if (!shouldStart) return JSON.stringify({ ok: true, resumed: true, started: false }, null, 2);
+
+      if (supervisor.done) {
+        return JSON.stringify(
+          {
+            ok: false,
+            resumed: true,
+            message: "Loop is marked done. Use ralph_create_supervisor_session(restart_if_done=true).",
+          },
+          null,
+          2
+        );
+      }
+
+      if (supervisor.currentRalphSessionId || supervisor.currentWorkerSessionId) {
+        return JSON.stringify({ ok: true, resumed: true, started: false, message: "Loop already running." }, null, 2);
+      }
+
+      supervisor.attempt = Math.max(1, supervisor.attempt || 1);
+      await spawnRalphSession(supervisor.attempt);
+      return JSON.stringify({ ok: true, resumed: true, started: true, attempt: supervisor.attempt }, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_validate_plan
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_validate_plan = tool({
+    description: "Validate PLAN.md structure and readiness for long-running loops.",
+    args: {},
+    async execute(_args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const planPath = NodePath.join(root, FILES.PLAN);
+      const exists = await run(fileExists(planPath));
+      if (!exists) {
+        return JSON.stringify(
+          {
+            ok: false,
+            errors: ["PLAN.md is missing."],
+            suggestions: ["Run ralph_bootstrap_plan(...) first."],
+          },
+          null,
+          2
+        );
+      }
+
+      const plan = await run(readFile(planPath).pipe(Effect.orElseSucceed(() => "")));
+      const validation = validatePlanContent(plan);
+      return JSON.stringify(validation, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_reset_state
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_reset_state = tool({
+    description: "Reset Ralph protocol/runtime state. Requires explicit confirmation token.",
+    args: {
+      scope: tool.schema
+        .enum(["attempt", "full"] as const)
+        .describe("attempt = reset scratch only; full = reset protocol + runtime state."),
+      confirm: tool.schema
+        .string()
+        .describe("Must equal RESET_RALPH_STATE to execute."),
+      preserve_logs: tool.schema.boolean().optional(),
+    },
+    async execute(args, ctx) {
+      if (args.confirm !== "RESET_RALPH_STATE") {
+        throw new Error("Confirmation token mismatch. Set confirm to RESET_RALPH_STATE.");
+      }
+      const root = ctx.worktree ?? worktree;
+      const preserveLogs = args.preserve_logs === true;
+      const ts = nowISO();
+
+      await run(writeFile(NodePath.join(root, FILES.CURR), templates.bootstrapCurrentState));
+      await run(writeFile(NodePath.join(root, FILES.PREV), `# Previous State (snapshot)\n\nCaptured: ${ts}\n\n(reset)\n`));
+      await run(writeFile(NodePath.join(root, FILES.NEXT_RALPH), `# Next Ralph Context\n\n- Timestamp: ${ts}\n- Verdict: reset\n\n## Summary\nManual reset\n\n## Next Step\nSet a new goal and run again.\n`));
+
+      if (args.scope === "full") {
+        await run(writeFile(NodePath.join(root, FILES.PLAN), "# Plan\n\n## Goal\n(fill in)\n\n## Requirements\n- (fill in)\n\n## Definition of Done\n- (fill in)\n"));
+        await run(writeFile(NodePath.join(root, FILES.RLM_INSTR), interpolate(templates.bootstrapRlmInstructions, { timestamp: ts })));
+        await run(writeFile(NodePath.join(root, FILES.TODOS), "# Todos\n\n- [ ] (optional)\n"));
+      }
+
+      if (!preserveLogs) {
+        await run(writeFile(NodePath.join(root, FILES.SUPERVISOR_LOG), `# Supervisor Log (append-only)\n\n- ${ts} reset\n`));
+        await run(writeFile(NodePath.join(root, FILES.CONVERSATION), `# Conversation Log (append-only)\n\n- ${ts} reset\n`));
+      }
+
+      supervisor.done = false;
+      supervisor.paused = false;
+      supervisor.attempt = 0;
+      supervisor.currentRalphSessionId = undefined;
+      supervisor.currentWorkerSessionId = undefined;
+      supervisor.activeReviewerName = undefined;
+      supervisor.activeReviewerAttempt = undefined;
+      supervisor.activeReviewerSessionId = undefined;
+      supervisor.activeReviewerOutputPath = undefined;
+      await persistReviewerState();
+      supervisor.reviewRequested = {};
+      supervisor.reviewerRuns = {};
+
+      await notifySupervisor("supervisor", `State reset (${args.scope}).`, "warning", true, ctx.sessionID ?? "default");
+      return JSON.stringify({ ok: true, scope: args.scope, preserveLogs }, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_quickstart_wizard
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_quickstart_wizard = tool({
+    description: "Guided setup helper: doctor autofix + plan bootstrap + optional supervisor start.",
+    args: {
+      goal: tool.schema.string().describe("Primary goal."),
+      requirements: tool.schema.array(tool.schema.string()).optional(),
+      stopping_conditions: tool.schema.array(tool.schema.string()).optional(),
+      features: tool.schema.array(tool.schema.string()).optional(),
+      steps: tool.schema.array(tool.schema.string()).optional(),
+      todos: tool.schema.array(tool.schema.string()).optional(),
+      start_loop: tool.schema.boolean().optional(),
+      overwrite_plan: tool.schema.boolean().optional(),
+      overwrite_todos: tool.schema.boolean().optional(),
+      autofix: tool.schema.boolean().optional(),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const doAutofix = args.autofix !== false;
+      const actions: string[] = [];
+
+      if (doAutofix) {
+        const configPath = NodePath.join(root, ".opencode", "ralph.json");
+        const configExists = await run(fileExists(configPath));
+        if (!configExists) {
+          const defaultCfg = {
+            enabled: true,
+            autoStartOnMainIdle: false,
+            statusVerbosity: "normal",
+            maxAttempts: 25,
+            heartbeatMinutes: 15,
+            verify: { command: ["bun", "run", "verify"], cwd: "." },
+            gateDestructiveToolsUntilContextLoaded: true,
+            maxRlmSliceLines: 200,
+            requireGrepBeforeLargeSlice: true,
+            grepRequiredThresholdLines: 120,
+            subAgentEnabled: true,
+            maxSubAgents: 5,
+            maxConversationLines: 1200,
+            conversationArchiveCount: 3,
+            reviewerEnabled: false,
+            reviewerRequireExplicitReady: true,
+            reviewerMaxRunsPerAttempt: 1,
+            reviewerOutputDir: ".opencode/reviews",
+            reviewerPostToConversation: true,
+            agentMdPath: "AGENT.md",
+          };
+          await run(writeFile(configPath, `${JSON.stringify(defaultCfg, null, 2)}\n`));
+          _configCache = null;
+          actions.push("Created .opencode/ralph.json");
+        }
+      }
+
+      const planPath = NodePath.join(root, FILES.PLAN);
+      if (await run(fileExists(planPath)) && args.overwrite_plan !== true) {
+        throw new Error("PLAN.md already exists. Set overwrite_plan=true to replace it in quickstart.");
+      }
+      const plan = renderPlan({
+        goal: args.goal,
+        requirements: args.requirements ?? [],
+        stoppingConditions: args.stopping_conditions ?? [],
+        features: args.features ?? [],
+        steps: args.steps ?? [],
+      });
+      await run(writeFile(planPath, plan));
+      actions.push("Wrote PLAN.md");
+
+      const todosPath = NodePath.join(root, FILES.TODOS);
+      if (!(await run(fileExists(todosPath))) || args.overwrite_todos === true) {
+        const items = (args.todos ?? args.steps ?? []).map((t) => `- [ ] ${t}`);
+        await run(writeFile(todosPath, ["# Todos", "", ...(items.length ? items : ["- [ ] (optional)"]), ""].join("\n")));
+        actions.push("Wrote TODOS.md");
+      }
+
+      const validation = validatePlanContent(plan);
+      const startLoop = args.start_loop === true;
+      if (startLoop) {
+        supervisor.sessionId = ctx.sessionID ?? "default";
+        supervisor.done = false;
+        supervisor.paused = false;
+        supervisor.attempt = 1;
+        await spawnRalphSession(1);
+        actions.push("Started loop at attempt 1");
+      }
+
+      await appendConversationEntry("supervisor", `Quickstart completed for goal: ${args.goal}`);
+      return JSON.stringify({ ok: validation.ok, actions, validation, started: startLoop }, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_request_review
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_request_review = tool({
+    description: "Mark current attempt as ready for reviewer pass.",
+    args: {
+      note: tool.schema.string().optional().describe("Optional reason/context for review."),
+    },
+    async execute(args, ctx) {
+      const sessionID = ctx.sessionID ?? "default";
+      const st = getSession(sessionID);
+      const attempt = st.attempt > 0 ? st.attempt : Math.max(1, supervisor.attempt);
+      const note = args.note?.trim() || "ready";
+      markReviewRequested(attempt, note);
+      await notifySupervisor(
+        `${st.role}/attempt-${attempt}`,
+        `Marked attempt ${attempt} ready for review: ${note}`,
+        "info",
+        true,
+        sessionID
+      );
+      return JSON.stringify({ ok: true, attempt, note }, null, 2);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_review_status
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_review_status = tool({
+    description: "Show reviewer gating state for current/known attempts.",
+    args: {},
+    async execute(_args, _ctx) {
+      return JSON.stringify(
+        {
+          activeReviewerName: supervisor.activeReviewerName ?? null,
+          activeReviewerAttempt: supervisor.activeReviewerAttempt ?? null,
+          activeReviewerSessionId: supervisor.activeReviewerSessionId ?? null,
+          activeReviewerOutputPath: supervisor.activeReviewerOutputPath ?? null,
+          reviewRequested: supervisor.reviewRequested,
+          reviewerRuns: supervisor.reviewerRuns,
+        },
+        null,
+        2
+      );
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_run_reviewer
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_run_reviewer = tool({
+    description:
+      "Run an optional reviewer sub-agent. Honors explicit review readiness and per-attempt run limits.",
+    args: {
+      force: tool.schema.boolean().optional(),
+      wait: tool.schema.boolean().optional(),
+      timeout_minutes: tool.schema.number().int().min(1).max(120).optional(),
+      output_path: tool.schema.string().optional(),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const sessionID = ctx.sessionID ?? "default";
+      const cfg = await run(getConfig());
+      const waitForDone = args.wait !== false;
+      const force = args.force === true;
+
+      const waitForReviewerCompletion = async (
+        reviewerName: string,
+        attemptN: number,
+        outputPath: string,
+        requestedNote: string | undefined
+      ): Promise<string> => {
+        const maxIterations = (args.timeout_minutes ?? 20) * 12;
+        const currPath = NodePath.join(root, ".opencode", "agents", reviewerName, "CURRENT_STATE.md");
+        for (let i = 0; i < maxIterations; i++) {
+          await sleep(5000);
+          const raw = await NodeFs.readFile(currPath, "utf8").catch(() => "");
+          const done = raw.includes(templates.subagentDoneHeading) || raw.includes(templates.subagentDoneSentinel);
+          if (!done) continue;
+
+          const reportBody = clampLines(raw, 800);
+          await run(writeFile(NodePath.join(root, outputPath), [
+            `# Reviewer Report — Attempt ${attemptN}`,
+            "",
+            `- reviewer: ${reviewerName}`,
+            `- generated: ${nowISO()}`,
+            `- requested: ${requestedNote ?? "(force/manual)"}`,
+            "",
+            "## Report",
+            reportBody,
+            "",
+          ].join("\n")));
+
+          supervisor.activeReviewerName = undefined;
+          supervisor.activeReviewerAttempt = undefined;
+          supervisor.activeReviewerSessionId = undefined;
+          supervisor.activeReviewerOutputPath = undefined;
+          clearReviewRequested(attemptN);
+          await persistReviewerState();
+
+          await notifySupervisor(
+            `reviewer/attempt-${attemptN}`,
+            `Reviewer completed. Report written to ${outputPath}.`,
+            "info",
+            cfg.reviewerPostToConversation,
+            sessionID
+          );
+
+          return JSON.stringify({ ok: true, started: true, done: true, outputPath, reviewerName }, null, 2);
+        }
+
+        return JSON.stringify(
+          {
+            ok: true,
+            started: true,
+            done: false,
+            reviewerName,
+            outputPath,
+            message: "Reviewer still running; call ralph_run_reviewer(wait=true) again or inspect with subagent_peek.",
+          },
+          null,
+          2
+        );
+      };
+
+      if (!cfg.reviewerEnabled && !force) {
+        return JSON.stringify(
+          { ok: false, reason: "reviewer disabled", hint: "Set reviewerEnabled=true in .opencode/ralph.json or use force=true." },
+          null,
+          2
+        );
+      }
+
+      const st = getSession(sessionID);
+      const attempt = st.attempt > 0 ? st.attempt : Math.max(1, supervisor.attempt);
+      const requested = supervisor.reviewRequested[attempt];
+      const runs = getReviewerRuns(attempt);
+
+      if (!force && cfg.reviewerRequireExplicitReady && !requested) {
+        return JSON.stringify(
+          { ok: false, reason: "review not requested", hint: "Call ralph_request_review(note) from the worker when ready." },
+          null,
+          2
+        );
+      }
+
+      if (!force && runs >= cfg.reviewerMaxRunsPerAttempt) {
+        return JSON.stringify(
+          { ok: false, reason: "review run limit reached", attempt, runs, limit: cfg.reviewerMaxRunsPerAttempt },
+          null,
+          2
+        );
+      }
+
+      if (supervisor.activeReviewerName) {
+        if (waitForDone && supervisor.activeReviewerOutputPath && supervisor.activeReviewerAttempt) {
+          return waitForReviewerCompletion(
+            supervisor.activeReviewerName,
+            supervisor.activeReviewerAttempt,
+            supervisor.activeReviewerOutputPath,
+            supervisor.reviewRequested[supervisor.activeReviewerAttempt]
+          );
+        }
+        return JSON.stringify(
+          {
+            ok: true,
+            started: false,
+            message: "Reviewer already running.",
+            activeReviewerName: supervisor.activeReviewerName,
+            activeReviewerAttempt: supervisor.activeReviewerAttempt,
+          },
+          null,
+          2
+        );
+      }
+
+      const reviewerName = `reviewer_${attempt}_${Date.now()}`;
+      const outputPath = args.output_path?.trim() || NodePath.join(cfg.reviewerOutputDir, `review-attempt-${attempt}.md`);
+      const stateDir = NodePath.join(".opencode", "agents", reviewerName);
+
+      await run(bootstrapSubAgent(root, reviewerName, `Review attempt ${attempt}`, templates));
+      const reviewerPrompt = [
+        `You are reviewer sub-agent \"${reviewerName}\" for attempt ${attempt}.`,
+        "",
+        "Goal:",
+        "- Review the repository changes with focus on correctness, edge cases, regressions, and maintainability.",
+        "- Produce concise findings with severity (high/medium/low) and concrete fixes.",
+        "",
+        "Protocol:",
+        `- State directory: ${stateDir}`,
+        "- Keep CURRENT_STATE.md updated while reviewing.",
+        `- Write final report under heading '${templates.subagentDoneHeading}' in CURRENT_STATE.md.`,
+        `- Output '${templates.subagentDoneSentinel}' when finished.`,
+        "",
+        "Expected report sections:",
+        "1) Verdict",
+        "2) Findings",
+        "3) Risk assessment",
+        "4) Recommended next actions",
+        "",
+      ].join("\n");
+
+      const childSessionResult = await client.session.create({ body: { title: `reviewer: ${reviewerName}` } });
+      const reviewerSessionId: string = childSessionResult.data?.id ?? `reviewer-${Date.now()}`;
+      sessionMap.set(reviewerSessionId, freshSession("subagent", attempt));
+      mutateSession(reviewerSessionId, (s) => { s.lastProgressAt = Date.now(); });
+
+      await client.session.prompt({
+        path: { id: reviewerSessionId },
+        body: { parts: [{ type: "text", text: reviewerPrompt }] },
+      });
+
+      supervisor.activeReviewerName = reviewerName;
+      supervisor.activeReviewerAttempt = attempt;
+      supervisor.activeReviewerSessionId = reviewerSessionId;
+      supervisor.activeReviewerOutputPath = outputPath;
+      incReviewerRuns(attempt);
+      await persistReviewerState();
+
+      await notifySupervisor(
+        `reviewer/attempt-${attempt}`,
+        `Started reviewer ${reviewerName}.`,
+        "info",
+        cfg.reviewerPostToConversation,
+        sessionID
+      );
+
+      if (!waitForDone) {
+        return JSON.stringify({ ok: true, started: true, reviewerName, reviewerSessionId, outputPath, waiting: false }, null, 2);
+      }
+
+      return waitForReviewerCompletion(reviewerName, attempt, outputPath, requested);
     },
   });
 
   // ────────────────────────────────────────────────────────────────────────────
   // § 13. Outer loop
   // ────────────────────────────────────────────────────────────────────────────
+
+  const emitHeartbeatWarnings = async (): Promise<void> => {
+    const cfg = await run(getConfig());
+    const thresholdMs = cfg.heartbeatMinutes * 60_000;
+    const now = Date.now();
+
+    const maybeWarn = async (sessionId: string | undefined, label: string): Promise<void> => {
+      if (!sessionId) return;
+      const st = sessionMap.get(sessionId);
+      if (!st) return;
+      const last = st.lastProgressAt;
+      if (!last) return;
+      if (now - last < thresholdMs) return;
+      await notifySupervisor(
+        `${st.role}/attempt-${st.attempt}`,
+        `${label} has no progress update for ${cfg.heartbeatMinutes}+ minutes.`,
+        "warning",
+        true,
+        sessionId
+      );
+      mutateSession(sessionId, (s) => { s.lastProgressAt = now; });
+    };
+
+    await maybeWarn(supervisor.currentRalphSessionId, "Strategist");
+    await maybeWarn(supervisor.currentWorkerSessionId, "Worker");
+  };
 
   /** Helper: run verify and parse the result into { verdict, details }. */
   const runAndParseVerify = async (): Promise<{ verdict: "pass" | "fail" | "unknown"; details: string }> => {
@@ -1581,6 +2882,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
     // Register BEFORE sending prompt so session.idle can identify it.
     supervisor.currentWorkerSessionId = workerId;
     sessionMap.set(workerId, freshSession("worker", attempt));
+    mutateSession(workerId, (s) => { s.lastProgressAt = Date.now(); });
 
     const promptText = interpolate(templates.workerPrompt, {
       attempt: String(attempt),
@@ -1591,6 +2893,13 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       path: { id: workerId },
       body: { parts: [{ type: "text", text: promptText }] },
     }).catch(() => {});
+
+    await notifySupervisor(
+      `supervisor/attempt-${attempt}`,
+      `Spawned worker session ${workerId}.`,
+      "info",
+      true
+    );
 
     return workerId;
   };
@@ -1610,6 +2919,13 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
 
     mutateSession(sessionID, (s) => { s.workerSpawned = true; });
     const workerId = await spawnRlmWorker(st.attempt);
+    await notifySupervisor(
+      `ralph/attempt-${st.attempt}`,
+      `Delegated coding to worker session ${workerId}.`,
+      "info",
+      true,
+      sessionID
+    );
     return JSON.stringify({ ok: true, workerSessionId: workerId, attempt: st.attempt }, null, 2);
   };
 
@@ -1625,6 +2941,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
 
     supervisor.currentRalphSessionId = ralphId;
     sessionMap.set(ralphId, freshSession("ralph", attempt));
+    mutateSession(ralphId, (s) => { s.lastProgressAt = Date.now(); });
 
     const promptText = interpolate(templates.ralphSessionPrompt, {
       attempt: String(attempt),
@@ -1635,6 +2952,13 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       path: { id: ralphId },
       body: { parts: [{ type: "text", text: promptText }] },
     }).catch(() => {});
+
+    await notifySupervisor(
+      `supervisor/attempt-${attempt}`,
+      `Spawned Ralph strategist session ${ralphId}.`,
+      "info",
+      true
+    );
   };
 
   /**
@@ -1647,8 +2971,28 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
 
     const cfg = await run(getConfig());
     if (!cfg.enabled) return;
+    if (!cfg.autoStartOnMainIdle) return;
 
+    const workerState = sessionMap.get(workerSessionId);
     supervisor.currentWorkerSessionId = undefined;
+
+    if (!workerState?.reportedStatus) {
+      await notifySupervisor(
+        `worker/attempt-${supervisor.attempt}`,
+        "No explicit status reported before idle; continuing with implicit verification flow.",
+        "info",
+        true,
+        workerSessionId
+      );
+    }
+
+    await notifySupervisor(
+      `worker/attempt-${supervisor.attempt}`,
+      `Worker ${workerSessionId} is idle; running verification.`,
+      "info",
+      true,
+      workerSessionId
+    );
 
     const { verdict, details } = await runAndParseVerify();
 
@@ -1663,6 +3007,13 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       await client.tui.showToast({
         body: { title: "Ralph: Done", message: "Verification passed. Loop complete.", variant: "success" },
       }).catch(() => {});
+      await notifySupervisor(
+        `worker/attempt-${supervisor.attempt}`,
+        "Verification passed. Loop complete.",
+        "info",
+        true,
+        workerSessionId
+      );
       return;
     }
 
@@ -1675,8 +3026,23 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
           variant: "warning",
         },
       }).catch(() => {});
+      await notifySupervisor(
+        `worker/attempt-${supervisor.attempt}`,
+        `Verification ${verdict}. Max attempts (${cfg.maxAttempts}) reached.`,
+        "warning",
+        true,
+        workerSessionId
+      );
       return;
     }
+
+    await notifySupervisor(
+      `worker/attempt-${supervisor.attempt}`,
+      `Verification ${verdict}. Preparing next attempt.`,
+      verdict === "fail" ? "warning" : "info",
+      true,
+      workerSessionId
+    );
 
     supervisor.attempt += 1;
     await rolloverState(supervisor.attempt - 1, verdict, details);
@@ -1696,15 +3062,32 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
     supervisor.currentRalphSessionId = undefined;
     const st = sessionMap.get(ralphSessionId);
 
+    if (st && !st.reportedStatus) {
+      await notifySupervisor(
+        `ralph/attempt-${st.attempt}`,
+        "No explicit strategist status reported before idle.",
+        "info",
+        true,
+        ralphSessionId
+      );
+    }
+
     if (!st?.workerSpawned) {
       // Ralph finished without spawning a worker — surface this so the user can investigate.
       await client.tui.showToast({
         body: {
           title: "Ralph: no worker spawned",
-          message: `Ralph session for attempt ${supervisor.attempt} ended without calling ralph_spawn_worker().`,
+          message: `Ralph session for attempt ${st?.attempt ?? supervisor.attempt} ended without calling ralph_spawn_worker().`,
           variant: "warning",
         },
       }).catch(() => {});
+      await notifySupervisor(
+        `ralph/attempt-${st?.attempt ?? supervisor.attempt}`,
+        "Strategist went idle without spawning a worker.",
+        "warning",
+        true,
+        ralphSessionId
+      );
     }
     // If worker was spawned, handleWorkerIdle will fire when it goes idle.
   };
@@ -1715,6 +3098,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
    */
   const handleMainIdle = async (sessionID: string): Promise<void> => {
     if (supervisor.done) return;
+    if (supervisor.paused) return;
     if (supervisor.currentRalphSessionId) return; // Ralph already running.
     if (supervisor.currentWorkerSessionId) return; // Worker already running.
 
@@ -1726,10 +3110,29 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
     if (supervisor.lastMainIdleAt && now - supervisor.lastMainIdleAt < 800) return;
     supervisor.lastMainIdleAt = now;
 
-    if (!supervisor.sessionId) supervisor.sessionId = sessionID;
+    if (!supervisor.sessionId) {
+      supervisor.sessionId = sessionID;
+      await notifySupervisor("supervisor", "Bound supervisor to main session.", "info", false, sessionID);
+    } else if (sessionID !== supervisor.sessionId) {
+      // Ignore unrelated sessions; only the bound supervisor session can kick loops.
+      return;
+    }
 
     // Kick off attempt 1: spawn the first Ralph strategist session.
+    const diagnostics = await checkSetup(worktree, cfg);
+    if (!diagnostics.ready) {
+      await notifySupervisor(
+        "supervisor",
+        "Auto-start skipped: setup incomplete. Run ralph_doctor(autofix=true) and ralph_bootstrap_plan().",
+        "warning",
+        true,
+        sessionID
+      );
+      return;
+    }
+
     supervisor.attempt = 1;
+    await notifySupervisor("supervisor", "Starting Ralph loop at attempt 1.", "info", true, sessionID);
     await spawnRalphSession(1);
   };
 
@@ -1751,8 +3154,22 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       subagent_await: tool_subagent_await,
       subagent_list: tool_subagent_list,
       ralph_report: tool_ralph_report,
+      ralph_set_status: tool_ralph_set_status,
       ralph_ask: tool_ralph_ask,
       ralph_respond: tool_ralph_respond,
+      ralph_doctor: tool_ralph_doctor,
+      ralph_bootstrap_plan: tool_ralph_bootstrap_plan,
+      ralph_create_supervisor_session: tool_ralph_create_supervisor_session,
+      ralph_end_supervision: tool_ralph_end_supervision,
+      ralph_supervision_status: tool_ralph_supervision_status,
+      ralph_pause_supervision: tool_ralph_pause_supervision,
+      ralph_resume_supervision: tool_ralph_resume_supervision,
+      ralph_validate_plan: tool_ralph_validate_plan,
+      ralph_reset_state: tool_ralph_reset_state,
+      ralph_quickstart_wizard: tool_ralph_quickstart_wizard,
+      ralph_request_review: tool_ralph_request_review,
+      ralph_review_status: tool_ralph_review_status,
+      ralph_run_reviewer: tool_ralph_run_reviewer,
     },
 
     // ── System prompt injection ──────────────────────────────────────────────
@@ -1765,7 +3182,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       const sessionID: string | undefined = input.sessionID ?? input.session_id;
       const role = sessionMap.get(sessionID ?? "")?.role;
       const base =
-        role === "worker" ? templates.workerSystemPrompt :
+        role === "worker" || role === "subagent" ? templates.workerSystemPrompt :
         role === "ralph"  ? templates.ralphSessionSystemPrompt :
         templates.systemPrompt;
       const full = templates.systemPromptAppend
@@ -1792,7 +3209,7 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       if (!sessionID) return;
 
       const state = sessionMap.get(sessionID);
-      if (state?.role !== "worker") return; // Only gate worker sessions.
+      if (state?.role !== "worker" && state?.role !== "subagent") return; // Only gate file-first coding sessions.
 
       const toolName: string = input.tool ?? input.call?.name ?? "";
       if (!toolName) return;
@@ -1814,21 +3231,42 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
         if (sessionMap.has(sessionID)) getSession(sessionID);
       }
 
+      if (event?.type === "session.status" && sessionID) {
+        const state = sessionMap.get(sessionID);
+        if (state) {
+          mutateSession(sessionID, (s) => { s.lastProgressAt = Date.now(); });
+          const statusRaw = String(event?.status ?? event?.data?.status ?? "").toLowerCase();
+          if (statusRaw === "error") {
+            await notifySupervisor(
+              `${state.role}/attempt-${state.attempt}`,
+              "Session reported error status.",
+              "error",
+              true,
+              sessionID
+            );
+          }
+        }
+      }
+
       if (event?.type === "session.idle" && sessionID) {
+        await emitHeartbeatWarnings().catch((err: unknown) => {
+          void appLog("error", "heartbeat warning error", { error: String(err) });
+        });
+
         if (supervisor.currentWorkerSessionId === sessionID) {
           // RLM worker went idle — verify and continue the loop.
           await handleWorkerIdle(sessionID).catch((err: unknown) => {
-            console.error("[ralph-rlm] handleWorkerIdle error:", err);
+            void appLog("error", "handleWorkerIdle error", { error: String(err), sessionID });
           });
         } else if (supervisor.currentRalphSessionId === sessionID) {
           // Ralph strategist session went idle.
           await handleRalphSessionIdle(sessionID).catch((err: unknown) => {
-            console.error("[ralph-rlm] handleRalphSessionIdle error:", err);
+            void appLog("error", "handleRalphSessionIdle error", { error: String(err), sessionID });
           });
         } else {
           // Main session (or unrelated) went idle — kick off attempt 1 if not started.
           await handleMainIdle(sessionID).catch((err: unknown) => {
-            console.error("[ralph-rlm] handleMainIdle error:", err);
+            void appLog("error", "handleMainIdle error", { error: String(err), sessionID });
           });
         }
       }

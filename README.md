@@ -2,6 +2,8 @@
 
 An [OpenCode](https://opencode.ai) plugin that turns an AI coding session into a persistent, self-correcting loop. Describe a goal, walk away, and come back to working code.
 
+New here? Start with [`GETTINGSTARTEDGUIDE.md`](GETTINGSTARTEDGUIDE.md).
+
 Two techniques combine to make this work:
 
 - **Ralph** — a strategist session spawned fresh per attempt. It reviews what failed, adjusts the plan and instructions, then delegates coding to a worker. It never writes code itself.
@@ -144,7 +146,7 @@ Sub-agents follow the same discipline as workers: one pass, file-first, fresh co
 
 Spawned sessions (Ralph and workers) can communicate back to the main conversation at runtime:
 
-- `ralph_report()` — fire-and-forget progress updates, appended to `SUPERVISOR_LOG.md` and posted to the main conversation
+- `ralph_report()` — fire-and-forget progress updates, appended to `SUPERVISOR_LOG.md` and `CONVERSATION.md`, and posted to the main conversation
 - `ralph_ask()` — blocks the session until you respond via `ralph_respond()`, enabling interactive decision points mid-loop (e.g., "should I rewrite auth.ts or patch it?")
 
 This is implemented via file-based IPC (`.opencode/pending_input.json`) so responses survive across any session boundary.
@@ -187,9 +189,12 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
 ```json
 {
   "enabled": true,
+  "autoStartOnMainIdle": false,
+  "statusVerbosity": "normal",
   "maxAttempts": 25,
+  "heartbeatMinutes": 15,
   "verify": {
-    "command": ["bun", "test"],
+    "command": ["bun", "run", "verify"],
     "cwd": "."
   },
   "gateDestructiveToolsUntilContextLoaded": true,
@@ -198,6 +203,13 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
   "grepRequiredThresholdLines": 120,
   "subAgentEnabled": true,
   "maxSubAgents": 5,
+  "maxConversationLines": 1200,
+  "conversationArchiveCount": 3,
+  "reviewerEnabled": false,
+  "reviewerRequireExplicitReady": true,
+  "reviewerMaxRunsPerAttempt": 1,
+  "reviewerOutputDir": ".opencode/reviews",
+  "reviewerPostToConversation": true,
   "agentMdPath": "AGENT.md"
 }
 ```
@@ -205,8 +217,11 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Set to `false` to disable the outer loop without removing the plugin. |
+| `autoStartOnMainIdle` | `false` | Automatically start attempt 1 when the main session goes idle. Set `true` to enable auto-start, or keep `false` for manual starts via `ralph_create_supervisor_session()`. |
+| `statusVerbosity` | `"normal"` | Supervisor status emission level: `minimal` (warnings/errors), `normal`, or `verbose`. |
 | `maxAttempts` | `20` | Hard stop after this many failed verify attempts. |
-| `verify.command` | — | Shell command to run as an array, e.g. `["bun", "test"]`. If omitted, verify always returns `unknown`. |
+| `heartbeatMinutes` | `15` | Warn if active strategist/worker has no progress for this many minutes. |
+| `verify.command` | — | Shell command to run as an array, e.g. `["bun", "run", "verify"]`. If omitted, verify always returns `unknown`. |
 | `verify.cwd` | `"."` | Working directory for the verify command, relative to the repo root. |
 | `gateDestructiveToolsUntilContextLoaded` | `true` | Block `write`, `edit`, `bash`, etc. until `ralph_load_context()` has been called in the current attempt. |
 | `maxRlmSliceLines` | `200` | Maximum lines a single `rlm_slice` call may return. |
@@ -214,11 +229,19 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
 | `grepRequiredThresholdLines` | `120` | Line threshold above which grep-first is required. |
 | `subAgentEnabled` | `true` | Allow `subagent_spawn`. |
 | `maxSubAgents` | `5` | Maximum concurrently running sub-agents per session. |
+| `maxConversationLines` | `1200` | Rotate `CONVERSATION.md` when it grows beyond this many lines. |
+| `conversationArchiveCount` | `3` | Number of rotated archives to keep (`CONVERSATION.1.md`, etc.). |
+| `reviewerEnabled` | `false` | Enable optional reviewer sub-agent tooling. |
+| `reviewerRequireExplicitReady` | `true` | Require explicit `ralph_request_review()` before reviewer runs. |
+| `reviewerMaxRunsPerAttempt` | `1` | Max reviewer runs per attempt unless forced. |
+| `reviewerOutputDir` | `".opencode/reviews"` | Directory for reviewer report files. |
+| `reviewerPostToConversation` | `true` | Post reviewer lifecycle updates to main conversation feed. |
 | `agentMdPath` | `"AGENT.md"` | Path (relative to repo root) to the project AGENT.md. Read by `ralph_load_context()` and included in the context payload. Set to `""` to disable. |
 
 ### verify command examples
 
 ```json
+{ "command": ["bun", "run", "verify"] }
 { "command": ["bun", "test"] }
 { "command": ["npm", "test"] }
 { "command": ["cargo", "test"] }
@@ -227,7 +250,20 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
 { "command": ["./scripts/verify.sh"] }
 ```
 
+If your repo has no test files yet, avoid `bun test` as a verify command because Bun exits non-zero when no tests match. Use a command that reflects your current quality gate (for example `bun run verify` with typecheck + build).
+
 The verify command is the loop's exit condition. It should be as comprehensive as you want the output to be. A verify that runs tests + typecheck + lint will produce code that passes all three; a verify that only checks syntax will produce syntactically valid code that may be logically broken.
+
+## Quick start (recommended)
+
+If you are setting up a repo from scratch, use this sequence:
+
+1. Run `ralph_quickstart_wizard(...)` for one-call setup, or use `ralph_doctor(autofix=true)` + `ralph_bootstrap_plan(...)` manually.
+2. Validate plan quality with `ralph_validate_plan()`.
+3. Start the loop with `ralph_create_supervisor_session()` (or enable auto-start if desired).
+4. Monitor progress in `SUPERVISOR_LOG.md` (structured) and `CONVERSATION.md` (readable timeline).
+
+If setup is incomplete, auto-start is skipped and the plugin emits a warning with next actions.
 
 
 ## Protocol files
@@ -245,6 +281,7 @@ The plugin bootstraps these files on first run if they do not exist. They are th
 | `NOTES_AND_LEARNINGS.md` | Append-only log of durable insights. Survives all context resets. |
 | `TODOS.md` | Optional lightweight task list. |
 | `SUPERVISOR_LOG.md` | Append-only feed of all `ralph_report()` entries across all attempts and sessions. |
+| `CONVERSATION.md` | Append-only human-readable timeline of supervisor updates, loop events, questions, and responses. |
 
 Sub-agent state lives under `.opencode/agents/<name>/` with the same structure.
 
@@ -354,6 +391,60 @@ This injects the file on every turn rather than only when `ralph_load_context()`
 
 ## Tools
 
+### Setup and supervisor bootstrap
+
+#### `ralph_doctor(autofix?)`
+
+Check whether the repository is ready for Ralph/RLM execution. It validates core setup (verify command, baseline files, placeholders) and returns structured diagnostics.
+
+With `autofix: true`, it applies safe bootstrap fixes such as creating `.opencode/ralph.json` defaults and a baseline `AGENT.md` when missing.
+
+#### `ralph_bootstrap_plan(goal, requirements?, stopping_conditions?, features?, steps?, todos?, overwrite_plan?, overwrite_todos?)`
+
+Generate `PLAN.md` and `TODOS.md` from explicit project requirements. This is the fastest way to turn a rough prompt into a concrete execution plan.
+
+#### `ralph_create_supervisor_session(start_loop?, force_rebind?, restart_if_done?)`
+
+Bind the current session as the supervisor and optionally start attempt 1 immediately.
+
+- Use this when `autoStartOnMainIdle` is disabled.
+- Use `force_rebind: true` to move supervision to a different session.
+- Use `restart_if_done: true` to start a new run after completion or manual stop.
+
+#### `ralph_end_supervision(reason?, clear_binding?)`
+
+Stop supervision for the current process. This prevents further auto-loop orchestration until restarted.
+
+- Use this when you want to pause/stop Ralph from spawning more sessions.
+- Resume later with `ralph_create_supervisor_session(restart_if_done=true)`.
+
+#### `ralph_supervision_status()`
+
+Return current supervision state: bound session, attempt number, active strategist/worker session IDs, and done status.
+
+#### `ralph_pause_supervision(reason?)`
+
+Pause automatic loop orchestration without ending supervision state.
+
+#### `ralph_resume_supervision(start_loop?)`
+
+Resume from pause. Optionally start the loop immediately.
+
+#### `ralph_reset_state(scope, confirm, preserve_logs?)`
+
+Reset protocol/runtime state. Requires `confirm: "RESET_RALPH_STATE"`.
+
+- `scope: "attempt"` resets scratch files.
+- `scope: "full"` resets scratch + baseline protocol scaffolding.
+
+#### `ralph_validate_plan()`
+
+Validate `PLAN.md` structure (goal, requirements, stopping conditions, milestones/checklists) before long runs.
+
+#### `ralph_quickstart_wizard(...)`
+
+One-call setup helper: applies basic setup, writes `PLAN.md`/`TODOS.md`, validates plan, and can optionally start the loop.
+
 ### Context loading
 
 #### `ralph_load_context()`
@@ -400,6 +491,8 @@ Run the configured verify command. Returns `{ verdict: "pass"|"fail"|"unknown", 
 
 **Ralph strategist sessions only.** Spawn a fresh RLM worker session for this attempt. Call this after reviewing protocol files and optionally updating `PLAN.md` / `RLM_INSTRUCTIONS.md`. Then stop — the plugin handles verification and spawns the next Ralph session if needed.
 
+If you call this from the main conversation you will get: `ralph_spawn_worker() can only be called from a Ralph strategist session.` In normal operation the plugin creates strategist sessions automatically on `session.idle`.
+
 ### Sub-agents
 
 #### `subagent_spawn(name, goal, context?)`
@@ -420,11 +513,35 @@ List all sub-agents registered in the current session with their name, goal, sta
 
 ### Supervisor communication
 
-These tools let spawned sessions (Ralph strategist, RLM worker) communicate back to the main conversation at runtime. State is carried in `.opencode/pending_input.json` for question/response pairs and `SUPERVISOR_LOG.md` for the progress feed.
+These tools let spawned sessions (Ralph strategist, RLM worker) communicate back to the main conversation at runtime. State is carried in `.opencode/pending_input.json` for question/response pairs, `SUPERVISOR_LOG.md` for structured status entries, and `CONVERSATION.md` for the readable event timeline.
+
+User answers to `ralph_ask()` are persisted too: when you reply via `ralph_respond()`, the response is appended to `CONVERSATION.md`.
+
+#### `ralph_set_status(status, note?, post_to_conversation?)`
+
+Optionally publish explicit attempt status (`running`, `blocked`, `done`, `error`) for the current session. This improves observability and handoffs.
+
+If an inner session does not call `ralph_set_status()`, the loop still works: idle + verify events continue with implicit status handling.
+
+#### `ralph_request_review(note?)`
+
+Mark the current attempt as review-ready. This is the recommended gate before running the reviewer so it does not execute too often.
+
+#### `ralph_run_reviewer(force?, wait?, timeout_minutes?, output_path?)`
+
+Run an optional reviewer sub-agent and write the review report to a file (default: `.opencode/reviews/review-attempt-N.md`).
+
+- Honors `reviewerRequireExplicitReady` and `reviewerMaxRunsPerAttempt` unless `force=true`.
+- Use `wait=true` (default) to block until review completion.
+- Reviewer gate/runtime state is persisted in `.opencode/reviewer_state.json` so restarts can resume tracking.
+
+#### `ralph_review_status()`
+
+Show reviewer gate state: active reviewer, review requests, and runs per attempt.
 
 #### `ralph_report(message, level?, post_to_conversation?)`
 
-Fire-and-forget progress report. Appends a timestamped entry to `SUPERVISOR_LOG.md`, shows a toast, and optionally posts into the main conversation so you can see what's happening without opening a separate session.
+Fire-and-forget progress report. Appends a timestamped entry to `SUPERVISOR_LOG.md` and `CONVERSATION.md`, shows a toast, and optionally posts into the main conversation so you can see what's happening without opening a separate session.
 
 ```
 args:
@@ -540,7 +657,7 @@ Set `maxAttempts` high (25–50), write a detailed `PLAN.md` with a precise defi
 3. On failure: roll state, spawn Ralph to diagnose and adjust, spawn the next worker.
 4. Repeat until it passes or hits `maxAttempts`.
 
-In the morning, check `SUPERVISOR_LOG.md` for the progress feed, `NOTES_AND_LEARNINGS.md` for what the loop learned, and `AGENT_CONTEXT_FOR_NEXT_RALPH.md` for where it stopped.
+In the morning, check `SUPERVISOR_LOG.md` and `CONVERSATION.md` for the progress feed, `NOTES_AND_LEARNINGS.md` for what the loop learned, and `AGENT_CONTEXT_FOR_NEXT_RALPH.md` for where it stopped.
 
 ### Supervisory check-in
 
@@ -555,6 +672,16 @@ Worker:
 ```
 
 You stay in the loop for decisions that require human judgment. Everything else runs unattended.
+
+### Optional reviewer pass (gated)
+
+To avoid over-running reviews, use explicit readiness:
+
+1. Worker marks readiness with `ralph_request_review("ready for correctness review")`.
+2. Supervisor runs `ralph_run_reviewer()`.
+3. Review report is written to `.opencode/reviews/review-attempt-N.md` (or configured output path).
+
+Reviewer execution is gated by `reviewerRequireExplicitReady` and `reviewerMaxRunsPerAttempt` unless forced.
 
 ### Parallel decomposition with sub-agents
 
@@ -581,11 +708,12 @@ The instructions file is the primary lever for improving loop performance. If th
 
 | Hook | What it does |
 |---|---|
-| `event: session.idle` | Routes idle events: **worker** → `handleWorkerIdle` (verify + continue loop); **ralph** → `handleRalphSessionIdle` (warn if no worker spawned); **main/other** → `handleMainIdle` (kick off attempt 1). |
+| `event: session.idle` | Routes idle events: **worker** → `handleWorkerIdle` (verify + continue loop); **ralph** → `handleRalphSessionIdle` (warn if no worker spawned); **main/other** → `handleMainIdle` (kick off attempt 1). Also emits heartbeat/staleness warnings and supervisor status updates to `SUPERVISOR_LOG.md` and `CONVERSATION.md`. |
 | `event: session.created` | Pre-allocates session state for known worker/ralph sessions. |
+| `event: session.status` | Refreshes heartbeat/progress timestamps for active sessions and surfaces explicit session error statuses to the supervisor feed. |
 | `experimental.chat.system.transform` | Three-way routing: **worker** → RLM file-first prompt; **ralph** → Ralph strategist prompt; **main/other** → supervisor prompt. |
 | `experimental.session.compacting` | Injects protocol file pointers into compaction context so state survives context compression. |
-| `tool.execute.before` | Blocks destructive tools (`write`, `edit`, `bash`, `delete`, `move`, `rename`) in **worker sessions** until `ralph_load_context()` has been called. Ralph strategist sessions are not gated. |
+| `tool.execute.before` | Blocks destructive tools (`write`, `edit`, `bash`, `delete`, `move`, `rename`) in **worker and sub-agent sessions** until `ralph_load_context()` has been called. Ralph strategist sessions are not gated. |
 
 
 ## Background
