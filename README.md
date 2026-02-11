@@ -6,8 +6,8 @@ New here? Start with [`GETTINGSTARTEDGUIDE.md`](GETTINGSTARTEDGUIDE.md).
 
 Two techniques combine to make this work:
 
-- **Ralph** — a strategist session spawned fresh per attempt. It reviews what failed, adjusts the plan and instructions, then delegates coding to a worker. It never writes code itself.
-- **RLM** (Recursive Language Model worker) — a file-first coding session based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601). Each attempt gets a clean context window and loads all state from files rather than inheriting noise from prior turns.
+- **Ralph** - the main session acting as strategist+supervisor. It reviews what failed, adjusts the plan and instructions, then delegates coding to a worker. It never writes code itself.
+- **RLM** (Recursive Language Model worker) - a file-first coding session based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601). Each attempt gets a clean context window and loads all state from files rather than inheriting noise from prior turns.
 
 
 ## The problem this solves
@@ -43,9 +43,9 @@ Context windows are session-local and finite. Files are persistent, inspectable,
 
 ### Separation of strategy and execution
 
-The Ralph strategist session exists because mixing strategy and execution in the same context is how reasoning degrades. When a session that just wrote failing code is also responsible for diagnosing *why* it failed and planning the next approach, it pattern-matches against its own failed reasoning. It proposes variations on what didn't work rather than stepping back.
+Ralph keeps strategy and execution separate: **you (main session)** handle strategy and delegation, while **workers** implement. When a session that just wrote failing code is also responsible for diagnosing *why* it failed and planning the next approach, it pattern-matches against its own failed reasoning. It proposes variations on what didn't work rather than stepping back.
 
-Ralph's session gets a fresh window. It reads the failure record cold, without the accumulated baggage of having written the code. This mirrors how experienced engineering teams work: the reviewer of a failing PR is often not the one who writes the fix.
+In this mode, the *worker* always gets a fresh window. It reads the failure record cold, without the accumulated baggage of having written the code. This mirrors how experienced engineering teams work: the reviewer of a failing PR is often not the one who writes the fix.
 
 ### The verify contract
 
@@ -63,52 +63,48 @@ The RLM paper demonstrates that full-file reads are expensive and often counterp
 
 `NOTES_AND_LEARNINGS.md` and `RLM_INSTRUCTIONS.md` are the loop's long-term memory. They survive context resets and accumulate across attempts. The loop doesn't just retry — it gets smarter with each failure.
 
-`RLM_INSTRUCTIONS.md` is the inner loop's operating manual. The Ralph strategist updates it between attempts when a pattern of failures reveals a gap in guidance. By attempt 10, the instructions encode everything learned from attempts 1-9.
+`RLM_INSTRUCTIONS.md` is the inner loop's operating manual. The main strategist (you) updates it between attempts when a pattern of failures reveals a gap in guidance. By attempt 10, the instructions encode everything learned from attempts 1-9.
 
 This is why the approach scales to overnight runs. A fresh worker in attempt 10 starts with the accumulated knowledge of 9 prior attempts, encoded in protocol files, without the accumulated noise.
 
 
 ## How it works
 
-### Three-level architecture
+### Two-level architecture (main session = strategist + supervisor)
 
 ```
-You → main session (thin meta-supervisor — your conversation)
+You → main session (supervisor + strategist in one)
          │
          ├─ attempt 1:
-         │    ├─ spawns Ralph strategist session R1  ← fresh context
-         │    │    R1: ralph_load_context() → review failures → update PLAN.md
-         │    │        → ralph_spawn_worker() → STOP
+         │    ├─ strategist (you): ralph_load_context() → review failures → update PLAN.md
+         │    ├─ ralph_spawn_worker() → spawns RLM worker session W1
          │    │
-         │    └─ spawns RLM worker session W1  ← fresh context
+         │    └─ RLM worker session W1  ← fresh context
          │         W1: ralph_load_context() → code → ralph_verify() → STOP
          │
          ├─ plugin verifies on W1 idle
          │    fail → roll state files → spawn attempt 2
          │
          ├─ attempt 2:
-         │    ├─ spawns Ralph strategist session R2  ← fresh context again
-         │    │    R2: reads AGENT_CONTEXT_FOR_NEXT_RALPH.md → adjusts strategy
-         │    │        → ralph_spawn_worker() → STOP
+         │    ├─ strategist (you): reads AGENT_CONTEXT_FOR_NEXT_RALPH.md → adjusts strategy
+         │    ├─ ralph_spawn_worker() → spawns RLM worker session W2
          │    │
-         │    └─ spawns RLM worker session W2  ← fresh context
+         │    └─ RLM worker session W2  ← fresh context
          │         W2: loads compact state from files → code → STOP
          │
          └─ pass → done toast
 ```
 
-Each session role has a distinct purpose and **fresh context window**:
+Each role has a distinct purpose and **fresh context window** where applicable:
 
 | Role | Session | Context | Responsibility |
 |---|---|---|---|
-| **main** | Your conversation | Persistent | Goal → stop. Plugin handles the rest. |
-| **ralph** | Per-attempt strategist | Fresh | Review failure, update PLAN.md / RLM_INSTRUCTIONS.md, call `ralph_spawn_worker()`. |
+| **main** | Your conversation | Persistent | Supervisor + strategist. Review failures, update PLAN.md / RLM_INSTRUCTIONS.md, call `ralph_spawn_worker()`. |
 | **worker** | Per-attempt coder | Fresh | `ralph_load_context()` → code → `ralph_verify()` → stop. |
 
 ### Roles and responsibilities (quick map)
 
-- **Supervisor (main session):** orchestration and decisions only. Never edits files or runs code; uses `ralph_*` tools to control lifecycle.
-- **Ralph strategist:** updates plan/instructions and delegates to a worker. No direct implementation.
+- **Supervisor+strategist (main session):** orchestration, planning, and delegation. Never edits files or runs code directly.
 - **RLM worker:** does the actual coding and verification for this attempt. One pass per session.
 - **Sub-agent:** narrow task helper; updates its own state files under `.opencode/agents/<name>/`.
 
@@ -116,15 +112,13 @@ Each session role has a distinct purpose and **fresh context window**:
 
 ```
 main idle
-  └─ spawn Ralph(1)
-       └─ Ralph(1) calls ralph_spawn_worker()
-            └─ spawn Worker(1)
-                 └─ Worker(1) calls ralph_verify() and goes idle
-                      └─ plugin runs verify
-                           ├─ pass → done
-                           └─ fail → roll state files
-                                └─ spawn Ralph(2)
-                                     └─ (repeat)
+  └─ strategist (you) calls ralph_spawn_worker()
+       └─ spawn Worker(1)
+            └─ Worker(1) calls ralph_verify() and goes idle
+                 └─ plugin runs verify
+                      ├─ pass → done
+                      └─ fail → roll state files
+                           └─ strategist (you) handles next attempt
 ```
 
 The plugin drives the loop from `session.idle` events. Neither Ralph nor the worker need to know about the outer loop — they just load context, do their job, and stop.
@@ -295,7 +289,7 @@ This repo now includes project-local agent files under `.opencode/agents/`:
 - `.opencode/agents/security-auditor.md`
 
 These profiles intentionally keep loop ownership in `ralph-rlm`.
-Do not model Ralph strategist/worker as OpenCode primary/subagent replacements.
+Do not model the strategist/worker roles as OpenCode primary/subagent replacements.
 
 
 ## Protocol files
@@ -524,9 +518,9 @@ Run the configured verify command. Returns `{ verdict: "pass"|"fail"|"unknown", 
 
 #### `ralph_spawn_worker()`
 
-**Ralph strategist sessions only.** Spawn a fresh RLM worker session for this attempt. Call this after reviewing protocol files and optionally updating `PLAN.md` / `RLM_INSTRUCTIONS.md`. Then stop — the plugin handles verification and spawns the next Ralph session if needed.
+**Main strategist only.** Spawn a fresh RLM worker session for this attempt. Call this after reviewing protocol files and optionally updating `PLAN.md` / `RLM_INSTRUCTIONS.md`. Then stop — the plugin handles verification and prompts you for the next attempt if needed.
 
-If you call this from the main conversation you will get: `ralph_spawn_worker() can only be called from a Ralph strategist session.` In normal operation the plugin creates strategist sessions automatically on `session.idle`.
+If you call this from an unbound session you will get: `ralph_spawn_worker() must be called from the bound supervisor session.` Bind first with `ralph_create_supervisor_session()`.
 
 ### Sub-agents
 
@@ -548,7 +542,7 @@ List all sub-agents registered in the current session with their name, goal, sta
 
 ### Supervisor communication
 
-These tools let spawned sessions (Ralph strategist, RLM worker) communicate back to the main conversation at runtime. State is carried in `.opencode/pending_input.json` for question/response pairs, `SUPERVISOR_LOG.md` for structured status entries, and `CONVERSATION.md` for the readable event timeline.
+These tools let spawned sessions (RLM worker + sub-agents) communicate back to the main conversation at runtime. State is carried in `.opencode/pending_input.json` for question/response pairs, `SUPERVISOR_LOG.md` for structured status entries, and `CONVERSATION.md` for the readable event timeline.
 
 User answers to `ralph_ask()` are persisted too: when you reply via `ralph_respond()`, the response is appended to `CONVERSATION.md`.
 
@@ -655,8 +649,8 @@ RALPH_BOOTSTRAP_RLM_INSTRUCTIONS="@/home/user/prompts/rlm-instructions.md"
 | `RALPH_CONTEXT_GATE_ERROR` | — | Error message thrown when the agent tries a destructive tool before loading context. |
 | `RALPH_WORKER_SYSTEM_PROMPT` | — | System prompt injected into every RLM worker session. Describes the one-pass contract. |
 | `RALPH_WORKER_PROMPT` | `{{attempt}}` | Initial prompt sent to each spawned RLM worker session. |
-| `RALPH_SESSION_SYSTEM_PROMPT` | — | System prompt injected into Ralph strategist sessions. |
-| `RALPH_SESSION_PROMPT` | `{{attempt}}` | Initial prompt sent to each spawned Ralph strategist session. |
+| `RALPH_SESSION_SYSTEM_PROMPT` | — | Legacy: system prompt for separate strategist sessions (unused in main-as-strategist mode). |
+| `RALPH_SESSION_PROMPT` | `{{attempt}}` | Prompt sent to the main strategist session when an attempt starts. |
 
 ### Example: custom continue prompt from a file
 
@@ -699,7 +693,7 @@ Set `maxAttempts` high (25–50), write a detailed `PLAN.md` with a precise defi
 
 1. Make an attempt.
 2. Run verify.
-3. On failure: roll state, spawn Ralph to diagnose and adjust, spawn the next worker.
+3. On failure: roll state, prompt the strategist (you) to diagnose and adjust, spawn the next worker.
 4. Repeat until it passes or hits `maxAttempts`.
 
 In the morning, check `SUPERVISOR_LOG.md` and `CONVERSATION.md` for the progress feed, `NOTES_AND_LEARNINGS.md` for what the loop learned, and `AGENT_CONTEXT_FOR_NEXT_RALPH.md` for where it stopped.
@@ -746,19 +740,19 @@ Parent agent:
 
 Edit `RLM_INSTRUCTIONS.md` to add project-specific playbooks, register MCP tools, or adjust the debug workflow. Changes persist across attempts. Use `ralph_update_rlm_instructions()` from within a session, or edit the file directly.
 
-The instructions file is the primary lever for improving loop performance. If the loop keeps making the same mistake, add a rule. If it keeps following an inefficient path, add a playbook. The Ralph strategist is responsible for updating these instructions between attempts based on what it observes in the failure record.
+The instructions file is the primary lever for improving loop performance. If the loop keeps making the same mistake, add a rule. If it keeps following an inefficient path, add a playbook. The main strategist (you) updates these instructions between attempts based on what it observes in the failure record.
 
 
 ## Hooks installed
 
 | Hook | What it does |
 |---|---|
-| `event: session.idle` | Routes idle events: **worker** → `handleWorkerIdle` (verify + continue loop); **ralph** → `handleRalphSessionIdle` (warn if no worker spawned); **main/other** → `handleMainIdle` (kick off attempt 1). Also emits heartbeat/staleness warnings and supervisor status updates to `SUPERVISOR_LOG.md` and `CONVERSATION.md`. |
-| `event: session.created` | Pre-allocates session state for known worker/ralph sessions. |
+| `event: session.idle` | Routes idle events: **worker** → `handleWorkerIdle` (verify + continue loop); **main/other** → `handleMainIdle` (kick off attempt 1). Also emits heartbeat/staleness warnings and supervisor status updates to `SUPERVISOR_LOG.md` and `CONVERSATION.md`. |
+| `event: session.created` | Pre-allocates session state for known worker sessions. |
 | `event: session.status` | Refreshes heartbeat/progress timestamps for active sessions and surfaces explicit session error statuses to the supervisor feed. |
-| `experimental.chat.system.transform` | Three-way routing: **worker** → RLM file-first prompt; **ralph** → Ralph strategist prompt; **main/other** → supervisor prompt. |
+| `experimental.chat.system.transform` | Two-way routing: **worker** → RLM file-first prompt; **main/other** → supervisor+strategist prompt. |
 | `experimental.session.compacting` | Injects protocol file pointers into compaction context so state survives context compression. |
-| `tool.execute.before` | Blocks destructive tools (`write`, `edit`, `bash`, `delete`, `move`, `rename`) in **worker and sub-agent sessions** until `ralph_load_context()` has been called. Ralph strategist sessions are not gated. |
+| `tool.execute.before` | Blocks destructive tools (`write`, `edit`, `bash`, `delete`, `move`, `rename`) in **worker and sub-agent sessions** until `ralph_load_context()` has been called. |
 
 
 ## Background
@@ -767,7 +761,7 @@ The instructions file is the primary lever for improving loop performance. If th
 
 The outer loop is named after the [Ralph Wiggum technique](https://www.geoffreyhuntley.com/ralph) — a `while` loop that feeds a prompt to an AI agent until it succeeds. The name reflects the philosophy: persistent, not clever. The loop doesn't try to be smart about when to give up. It tries, records what happened, and tries again with better instructions.
 
-The key addition in this plugin over a naive Ralph implementation is the **separation of the strategist from the worker**. A naive loop re-prompts the same session. This plugin spawns a fresh Ralph strategist to review the failure before spawning the next worker. The strategist's fresh context means it analyses the failure without being anchored to the reasoning that produced it.
+The key addition in this plugin over a naive Ralph implementation is the **separation of the strategist from the worker**. The main session handles strategy and delegation, while each worker gets a fresh context to implement. This keeps planning clean while still benefiting from fresh worker windows.
 
 ### The RLM inner loop
 

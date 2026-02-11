@@ -8,31 +8,29 @@ This guide gets you from zero to a working Ralph + RLM loop quickly.
 - Start OpenCode in your repo.
 - Ensure `.opencode/ralph.json` exists (or run doctor in step 2).
 
-## 1.5) Understand the roles (supervisor vs Ralph vs worker)
+## 1.5) Understand the roles (main strategist vs worker)
 
-Ralph-RLM has three distinct layers so the agent behavior stays predictable:
+Ralph-RLM has two distinct layers so the agent behavior stays predictable:
 
-- **Supervisor (your current session):** Orchestrates the loop and responds to `ralph_ask()` questions. It should not implement code. It monitors progress and controls lifecycle (pause/resume/end).
-- **Ralph strategist (per-attempt):** A short-lived planning session created by the plugin. It reviews outcomes, updates `PLAN.md` / `RLM_INSTRUCTIONS.md`, then calls `ralph_spawn_worker()`.
+- **Main session (you):** Supervisor + strategist in one. It orchestrates the loop, updates `PLAN.md` / `RLM_INSTRUCTIONS.md`, and calls `ralph_spawn_worker()`. It should not implement code.
 - **RLM worker (per-attempt):** A fresh coding session that does the actual edits, calls `ralph_verify()`, then stops.
 
-Think of it as: **Supervisor** (you) → **Ralph strategist** (planning) → **RLM worker** (implementation).
+Think of it as: **Main strategist** (you) → **RLM worker** (implementation).
 
 ### Quick mental model
 
 ```
-Supervisor (you)
-  └─ Ralph strategist (attempt N)
-       └─ RLM worker (attempt N)
+Main strategist (you)
+  └─ RLM worker (attempt N)
             └─ ralph_verify()
                 ├─ pass → done
-                └─ fail → attempt N+1 (new Ralph + worker)
+                └─ fail → attempt N+1 (new worker)
 ```
 
 ### Expected behavior checklist
 
-- Supervisor stays high-level (orchestration, decisions, answering `ralph_ask`).
-- Ralph strategist updates `PLAN.md` / `RLM_INSTRUCTIONS.md`, then spawns a worker.
+- Main strategist stays high-level (orchestration, decisions, answering `ralph_ask`).
+- Main strategist updates `PLAN.md` / `RLM_INSTRUCTIONS.md`, then spawns a worker.
 - Worker does the actual edits, calls `ralph_verify()`, then stops.
 - The loop continues until `verify.command` passes or `maxAttempts` is reached.
 
@@ -147,8 +145,8 @@ Reviewer runtime state persists in `.opencode/reviewer_state.json`.
 
 ## 9) Troubleshooting
 
-- `ralph_spawn_worker() can only be called from a Ralph strategist session`
-  - Expected in main session. Start with `ralph_create_supervisor_session()` and let strategist spawn workers.
+- `ralph_spawn_worker() must be called from the bound supervisor session`
+  - Start with `ralph_create_supervisor_session()` and call `ralph_spawn_worker()` from that session.
 - Loop not starting
   - Check `ralph_supervision_status()` and run `ralph_doctor(autofix=true)`.
 - Verify always failing
