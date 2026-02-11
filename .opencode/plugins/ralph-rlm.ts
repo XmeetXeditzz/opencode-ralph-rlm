@@ -223,6 +223,9 @@ const DEFAULT_TEMPLATES: PromptTemplates = {
     "- Workers are spawned per-attempt with a fresh context window. They load state from protocol files.",
     "- Protocol files (PLAN.md, RLM_INSTRUCTIONS.md, etc.) persist across all attempts — edit them to guide workers.",
     "- After each worker attempt the plugin runs verify and either finishes or spawns the next worker.",
+    "- Spawned sessions (Ralph strategist, RLM worker) may send questions via ralph_ask().",
+    "  When you receive one, call ralph_respond(id, answer) to unblock the session.",
+    "- Monitor progress in SUPERVISOR_LOG.md or via toast notifications.",
   ].join("\n"),
 
   systemPromptAppend: "",
@@ -490,6 +493,37 @@ type SubAgentRecord = {
   result?: string;
 };
 
+const PENDING_INPUT_PATH = ".opencode/pending_input.json";
+
+type QuestionRecord = {
+  id: string;
+  from: SessionRole;
+  attempt: number;
+  question: string;
+  context?: string | undefined;
+  askedAt: string;
+};
+
+type PendingInputData = {
+  questions: QuestionRecord[];
+  responses: Record<string, { answer: string; respondedAt: string }>;
+};
+
+const readPendingInput = async (root: string): Promise<PendingInputData> => {
+  try {
+    const raw = await NodeFs.readFile(NodePath.join(root, PENDING_INPUT_PATH), "utf8");
+    return JSON.parse(raw) as PendingInputData;
+  } catch { return { questions: [], responses: {} }; }
+};
+
+const writePendingInput = async (root: string, data: PendingInputData): Promise<void> => {
+  const p = NodePath.join(root, PENDING_INPUT_PATH);
+  await NodeFs.mkdir(NodePath.dirname(p), { recursive: true });
+  await NodeFs.writeFile(p, JSON.stringify(data, null, 2), "utf8");
+};
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
 /**
  * The role of a spawned session within the Ralph+RLM hierarchy.
  *
@@ -620,7 +654,11 @@ function extractHeadings(md: string, max: number): string {
 }
 
 const DESTRUCTIVE_TOOLS = new Set(["write", "edit", "bash", "delete", "move", "rename"]);
-const SAFE_TOOLS = new Set(["ralph_load_context", "rlm_grep", "rlm_slice", "subagent_peek", "ralph_verify"]);
+const SAFE_TOOLS = new Set([
+  "ralph_load_context", "rlm_grep", "rlm_slice",
+  "subagent_peek", "ralph_verify",
+  "ralph_report", "ralph_ask", "ralph_respond",
+]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 7. Protocol file constants
@@ -635,6 +673,7 @@ const FILES = {
   CURR: "CURRENT_STATE.md",
   NOTES: "NOTES_AND_LEARNINGS.md",
   TODOS: "TODOS.md",
+  SUPERVISOR_LOG: "SUPERVISOR_LOG.md",
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,6 +727,7 @@ const bootstrapProtocolFiles = (
         ensureFile(j(FILES.CURR), templates.bootstrapCurrentState),
         ensureFile(j(FILES.NOTES), `# Notes and Learnings (append-only)\n\n- ${ts} created\n`),
         ensureFile(j(FILES.TODOS), `# Todos\n\n- [ ] (optional)\n`),
+        ensureFile(j(FILES.SUPERVISOR_LOG), `# Supervisor Log (append-only)\n\n- ${ts} created\n`),
       ],
       { concurrency: "unbounded" }
     );
@@ -1339,6 +1379,156 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_report
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_report = tool({
+    description:
+      "Report progress to the supervisor. Appends to SUPERVISOR_LOG.md, shows a toast, and optionally posts a message to the main conversation.",
+    args: {
+      message: tool.schema.string().describe("Progress message to report."),
+      level: tool.schema
+        .enum(["info", "warning", "error"] as const)
+        .optional()
+        .describe("Log level (default: info)."),
+      post_to_conversation: tool.schema
+        .boolean()
+        .optional()
+        .describe("Whether to post to the main conversation (default: true)."),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const sessionID = ctx.sessionID ?? "default";
+      const st = getSession(sessionID);
+      const level = args.level ?? "info";
+      const ts = nowISO();
+      const roleTag = `${st.role}/attempt-${st.attempt}`;
+      const logLine = `- [${ts}][${level.toUpperCase()}][${roleTag}] ${args.message}\n`;
+
+      await run(appendFile(NodePath.join(root, FILES.SUPERVISOR_LOG), logLine));
+
+      await client.tui.showToast({
+        body: {
+          variant: level,
+          title: `Ralph [${roleTag}]`,
+          message: args.message.slice(0, 120),
+        },
+      }).catch(() => {});
+
+      const postToConv = args.post_to_conversation !== false;
+      if (postToConv && supervisor.sessionId && supervisor.sessionId !== sessionID) {
+        await client.session.promptAsync({
+          path: { id: supervisor.sessionId },
+          body: { parts: [{ type: "text", text: `[${roleTag}]: ${args.message}` }] },
+        }).catch(() => {});
+      }
+
+      return `Reported: ${args.message}`;
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_ask
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_ask = tool({
+    description:
+      "Ask the supervisor a question and wait for a response. Blocks until the supervisor calls ralph_respond() or the timeout expires.",
+    args: {
+      question: tool.schema.string().describe("The question to ask the supervisor."),
+      context: tool.schema.string().optional().describe("Additional context for the question."),
+      timeout_minutes: tool.schema
+        .number()
+        .int()
+        .min(1)
+        .max(120)
+        .optional()
+        .describe("How many minutes to wait for a response (default: 15)."),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const sessionID = ctx.sessionID ?? "default";
+      const st = getSession(sessionID);
+      const id = `ask-${Date.now()}`;
+      const roleTag = `${st.role}/attempt-${st.attempt}`;
+      const timeoutMinutes = args.timeout_minutes ?? 15;
+
+      const data = await readPendingInput(root);
+      const record: QuestionRecord = {
+        id,
+        from: st.role,
+        attempt: st.attempt,
+        question: args.question,
+        context: args.context,
+        askedAt: nowISO(),
+      };
+      data.questions.push(record);
+      await writePendingInput(root, data);
+
+      await client.tui.showToast({
+        body: {
+          variant: "warning",
+          title: "Waiting for supervisor input",
+          message: args.question.slice(0, 120),
+        },
+      }).catch(() => {});
+
+      if (supervisor.sessionId && supervisor.sessionId !== sessionID) {
+        const promptMsg = `[${roleTag} asks — ID: ${id}]: ${args.question}\n\nCall ralph_respond('${id}', 'your answer') to unblock.`;
+        await client.session.promptAsync({
+          path: { id: supervisor.sessionId },
+          body: { parts: [{ type: "text", text: promptMsg }] },
+        }).catch(() => {});
+      }
+
+      const maxIterations = timeoutMinutes * 12;
+      for (let i = 0; i < maxIterations; i++) {
+        await sleep(5000);
+        const current = await readPendingInput(root);
+        if (current.responses[id]) {
+          return JSON.stringify({ id, answer: current.responses[id].answer });
+        }
+      }
+
+      throw new Error(`ralph_ask timeout: no response after ${timeoutMinutes} minutes (ID: ${id})`);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Tool: ralph_respond
+  // ────────────────────────────────────────────────────────────────────────────
+  const tool_ralph_respond = tool({
+    description:
+      "Respond to a pending question from a spawned session. Unblocks the session that called ralph_ask().",
+    args: {
+      id: tool.schema.string().describe("The question ID from the ralph_ask() call (format: ask-NNNN)."),
+      answer: tool.schema.string().describe("Your answer to the question."),
+    },
+    async execute(args, ctx) {
+      const root = ctx.worktree ?? worktree;
+      const data = await readPendingInput(root);
+      const known = data.questions.find((q) => q.id === args.id);
+      if (!known) {
+        const pending = data.questions
+          .filter((q) => !data.responses[q.id])
+          .map((q) => `  ${q.id}: "${q.question.slice(0, 60)}"`)
+          .join("\n");
+        throw new Error(
+          `Question ID "${args.id}" not found in pending_input.json.` +
+          (pending ? `\n\nPending unanswered questions:\n${pending}` : "\n\nNo pending questions found.")
+        );
+      }
+      if (data.responses[args.id]) {
+        // Already answered — overwrite and note it.
+        data.responses[args.id] = { answer: args.answer, respondedAt: nowISO() };
+        await writePendingInput(root, data);
+        return `Response updated for question ${args.id} (was already answered; new answer overwrites old).`;
+      }
+      data.responses[args.id] = { answer: args.answer, respondedAt: nowISO() };
+      await writePendingInput(root, data);
+      return `Response recorded for question ${args.id}.`;
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
   // § 13. Outer loop
   // ────────────────────────────────────────────────────────────────────────────
 
@@ -1560,6 +1750,9 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
       subagent_spawn: tool_subagent_spawn,
       subagent_await: tool_subagent_await,
       subagent_list: tool_subagent_list,
+      ralph_report: tool_ralph_report,
+      ralph_ask: tool_ralph_ask,
+      ralph_respond: tool_ralph_respond,
     },
 
     // ── System prompt injection ──────────────────────────────────────────────

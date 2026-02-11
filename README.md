@@ -1,15 +1,74 @@
 # ralph-rlm
 
-An [OpenCode](https://opencode.ai) plugin that implements two interlocking AI loop techniques:
+An [OpenCode](https://opencode.ai) plugin that turns an AI coding session into a persistent, self-correcting loop. Describe a goal, walk away, and come back to working code.
 
-- **Ralph** (strategist) — a fresh session spawned per attempt that reviews failures, updates protocol files, and delegates coding to an RLM worker via `ralph_spawn_worker()`.
-- **RLM** (worker) — a file-first agent discipline based on [Recursive Language Models](https://arxiv.org/abs/2512.24601), where each attempt gets a **fresh context window** that loads state from files rather than accumulating noise across turns.
+Two techniques combine to make this work:
 
-The combination lets you walk away from a task and come back to working code.
+- **Ralph** — a strategist session spawned fresh per attempt. It reviews what failed, adjusts the plan and instructions, then delegates coding to a worker. It never writes code itself.
+- **RLM** (Recursive Language Model worker) — a file-first coding session based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601). Each attempt gets a clean context window and loads all state from files rather than inheriting noise from prior turns.
+
+
+## The problem this solves
+
+Long-running AI coding sessions degrade. By attempt 4 or 5, the context window contains echoes of three failed strategies, retracted plans, contradictory tool outputs, and the model's own hedging. The agent starts reasoning from a corrupted premise. You end up re-explaining what went wrong, manually pruning bad state, or starting over.
+
+The standard response — "just use a bigger context window" — makes things worse. More capacity means more noise survives longer. The problem isn't window size, it's window hygiene.
+
+ralph-rlm solves this by treating each attempt as disposable. State lives in files, not in the context window. Each new session loads exactly what it needs from those files and nothing else. The loop gets smarter with each failure by updating its instructions — not by accumulating turns.
+
+
+## Philosophy
+
+### Fresh context windows over long conversations
+
+The insight from the RLM paper is that context windows are not free. Every token of prior conversation competes with new information for the model's attention. Failed attempts, debug noise, and superseded plans don't disappear when you move on — they stay in the window and subtly bias future reasoning.
+
+The solution is to make context windows **ephemeral by design**. Each worker session:
+- Starts clean, with no memory of prior attempts
+- Loads exactly the state it needs from protocol files
+- Does one pass, then stops
+
+The protocol files carry forward what matters. Everything else is discarded.
+
+### Files as the memory primitive
+
+Context windows are session-local and finite. Files are persistent, inspectable, diff-able, and shared across sessions. By routing all persistent state through the filesystem, the loop gains properties that in-context memory cannot provide:
+
+- **Durability**: state survives crashes, restarts, and context compression
+- **Inspectability**: you can read `AGENT_CONTEXT_FOR_NEXT_RALPH.md` at any time to see exactly what the next attempt will see
+- **Shareability**: multiple sessions (Ralph, worker, sub-agents) read and write the same files concurrently
+- **Debuggability**: the entire history of an overnight run is in plaintext files you can grep
+
+### Separation of strategy and execution
+
+The Ralph strategist session exists because mixing strategy and execution in the same context is how reasoning degrades. When a session that just wrote failing code is also responsible for diagnosing *why* it failed and planning the next approach, it pattern-matches against its own failed reasoning. It proposes variations on what didn't work rather than stepping back.
+
+Ralph's session gets a fresh window. It reads the failure record cold, without the accumulated baggage of having written the code. This mirrors how experienced engineering teams work: the reviewer of a failing PR is often not the one who writes the fix.
+
+### The verify contract
+
+The loop is only as good as its exit condition. `verify.command` is the single source of truth for "done." A machine-verifiable criterion — tests pass, types check, linter clean — turns the exit question from a judgment call into a boolean. The model cannot talk its way out of a failing test suite.
+
+This contract has a corollary: **the better your verify command, the better the loop performs.** A verify that checks only syntax will produce syntactically valid but logically broken code. A verify that runs the full test suite, typechecks, and lints will produce code that passes all three.
+
+### The grep-first discipline
+
+The RLM paper demonstrates that full-file reads are expensive and often counterproductive. When a model dumps a 2000-line file into its context to answer a question that requires 30 lines, the relevant section is buried in noise and the window fills with irrelevant code.
+
+`rlm_grep` + `rlm_slice` give surgical access: search first to find line numbers, then read only the relevant range. `CONTEXT_FOR_RLM.md` is the designated large-reference file — a place to paste API docs, specs, or large codebases that should never be read in full.
+
+### Persistent learning across attempts
+
+`NOTES_AND_LEARNINGS.md` and `RLM_INSTRUCTIONS.md` are the loop's long-term memory. They survive context resets and accumulate across attempts. The loop doesn't just retry — it gets smarter with each failure.
+
+`RLM_INSTRUCTIONS.md` is the inner loop's operating manual. The Ralph strategist updates it between attempts when a pattern of failures reveals a gap in guidance. By attempt 10, the instructions encode everything learned from attempts 1-9.
+
+This is why the approach scales to overnight runs. A fresh worker in attempt 10 starts with the accumulated knowledge of 9 prior attempts, encoded in protocol files, without the accumulated noise.
+
 
 ## How it works
 
-### Three-level multi-agent architecture
+### Three-level architecture
 
 ```
 You → main session (thin meta-supervisor — your conversation)
@@ -44,34 +103,51 @@ Each session role has a distinct purpose and **fresh context window**:
 | **ralph** | Per-attempt strategist | Fresh | Review failure, update PLAN.md / RLM_INSTRUCTIONS.md, call `ralph_spawn_worker()`. |
 | **worker** | Per-attempt coder | Fresh | `ralph_load_context()` → code → `ralph_verify()` → stop. |
 
-Each RLM worker session:
-- Receives a **fresh context window** — no accumulated noise from prior attempts
-- Loads all context from the protocol files via `ralph_load_context()`
-- Does **one pass**: load → code → verify → stop
-- Never re-prompts itself — Ralph controls iteration
+### The state machine
 
-Each Ralph strategist session:
-- Receives a **fresh context window** per attempt
-- Reviews what failed and why (via `AGENT_CONTEXT_FOR_NEXT_RALPH.md`)
-- Optionally updates `PLAN.md` or `RLM_INSTRUCTIONS.md` to guide the next worker
-- Calls `ralph_spawn_worker()` to hand off coding, then stops
-- Never writes code itself
+```
+main idle
+  └─ spawn Ralph(1)
+       └─ Ralph(1) calls ralph_spawn_worker()
+            └─ spawn Worker(1)
+                 └─ Worker(1) calls ralph_verify() and goes idle
+                      └─ plugin runs verify
+                           ├─ pass → done
+                           └─ fail → roll state files
+                                └─ spawn Ralph(2)
+                                     └─ (repeat)
+```
+
+The plugin drives the loop from `session.idle` events. Neither Ralph nor the worker need to know about the outer loop — they just load context, do their job, and stop.
 
 ### The RLM worker discipline
 
 Each worker session is required to:
 
-1. Call `ralph_load_context()` first — blocked from write/edit/bash until it does.
+1. Call `ralph_load_context()` first — blocked from `write`/`edit`/`bash` until it does.
 2. Read `PLAN.md` and `RLM_INSTRUCTIONS.md` as authoritative instructions.
-3. Use `rlm_grep` + `rlm_slice` to access large reference documents instead of dumping them whole.
-4. Write scratch work to `CURRENT_STATE.md`.
+3. Use `rlm_grep` + `rlm_slice` to access large reference documents — never dump them whole.
+4. Write scratch work to `CURRENT_STATE.md` throughout the attempt.
 5. Promote durable changes (completed milestones, new constraints) to `PLAN.md`.
 6. Append insights to `NOTES_AND_LEARNINGS.md`.
 7. Call `ralph_verify()` when ready, then stop.
 
+The one-pass contract is enforced socially (system prompt) and mechanically (context gate on destructive tools). Workers do not re-prompt themselves. Ralph controls iteration.
+
 ### Sub-agents
 
-For tasks that can be decomposed, a worker can `subagent_spawn` a child session with an isolated goal. Each sub-agent gets its own state directory under `.opencode/agents/<name>/`. The worker polls with `subagent_await` and integrates the result.
+For tasks that can be decomposed, a worker can `subagent_spawn` a child session with an isolated goal. Each sub-agent gets its own state directory under `.opencode/agents/<name>/` and the same protocol file structure. The worker polls with `subagent_await` and integrates the result.
+
+Sub-agents follow the same discipline as workers: one pass, file-first, fresh context.
+
+### Supervisor communication
+
+Spawned sessions (Ralph and workers) can communicate back to the main conversation at runtime:
+
+- `ralph_report()` — fire-and-forget progress updates, appended to `SUPERVISOR_LOG.md` and posted to the main conversation
+- `ralph_ask()` — blocks the session until you respond via `ralph_respond()`, enabling interactive decision points mid-loop (e.g., "should I rewrite auth.ts or patch it?")
+
+This is implemented via file-based IPC (`.opencode/pending_input.json`) so responses survive across any session boundary.
 
 
 ## Install
@@ -151,6 +227,8 @@ Create `.opencode/ralph.json`. All fields are optional — the plugin runs with 
 { "command": ["./scripts/verify.sh"] }
 ```
 
+The verify command is the loop's exit condition. It should be as comprehensive as you want the output to be. A verify that runs tests + typecheck + lint will produce code that passes all three; a verify that only checks syntax will produce syntactically valid code that may be logically broken.
+
 
 ## Protocol files
 
@@ -161,13 +239,37 @@ The plugin bootstraps these files on first run if they do not exist. They are th
 | `PLAN.md` | Goals, milestones, definition of done, changelog. Updated via `ralph_update_plan()`. |
 | `RLM_INSTRUCTIONS.md` | Inner loop operating manual and playbooks. Updated via `ralph_update_rlm_instructions()`. |
 | `CURRENT_STATE.md` | Scratch pad for the current Ralph attempt. Reset on each rollover. |
-| `PREVIOUS_STATE.md` | Snapshot of the last attempt's scratch. Automatically written by Ralph on rollover. |
-| `AGENT_CONTEXT_FOR_NEXT_RALPH.md` | Shim injected at the start of the next attempt: verdict, summary, next step. |
+| `PREVIOUS_STATE.md` | Snapshot of the last attempt's scratch. Automatically written on rollover. |
+| `AGENT_CONTEXT_FOR_NEXT_RALPH.md` | Shim passed to the next attempt: verdict, summary, next step. |
 | `CONTEXT_FOR_RLM.md` | Large reference document (API docs, specs, etc.). Always accessed via `rlm_grep` + `rlm_slice`. |
-| `NOTES_AND_LEARNINGS.md` | Append-only log of durable insights from across attempts. |
+| `NOTES_AND_LEARNINGS.md` | Append-only log of durable insights. Survives all context resets. |
 | `TODOS.md` | Optional lightweight task list. |
+| `SUPERVISOR_LOG.md` | Append-only feed of all `ralph_report()` entries across all attempts and sessions. |
 
 Sub-agent state lives under `.opencode/agents/<name>/` with the same structure.
+
+### How files flow between attempts
+
+```
+Attempt N worker writes:
+  CURRENT_STATE.md     ← scratch: what I tried, what I found
+  NOTES_AND_LEARNINGS.md ← append: durable insight from this attempt
+
+On N→N+1 rollover, plugin writes:
+  PREVIOUS_STATE.md    ← copy of CURRENT_STATE.md
+  CURRENT_STATE.md     ← reset to blank template
+  AGENT_CONTEXT_FOR_NEXT_RALPH.md ← verdict + summary + next step
+
+Ralph(N+1) reads and optionally updates:
+  AGENT_CONTEXT_FOR_NEXT_RALPH.md ← why it failed
+  PLAN.md                          ← adjusts strategy
+  RLM_INSTRUCTIONS.md              ← adjusts worker guidance
+
+Worker(N+1) reads:
+  All of the above via ralph_load_context()
+```
+
+This is why the loop can run overnight. Each fresh session starts with the accumulated knowledge of all prior attempts, encoded in files — not in a context window that would be reset.
 
 
 ## Working with AGENT.md
@@ -188,7 +290,7 @@ OpenCode loads `AGENT.md` from the repo root into every session's system prompt 
 - Sub-agents, which run in isolated sessions that may not have AGENT.md injected, still see the project rules.
 - Every attempt starts with both the static project context and the dynamic loop state in one payload.
 
-To disable AGENT.md inclusion, set `agentMdPath` to `""` in `.opencode/ralph.json`:
+To disable AGENT.md inclusion:
 
 ```json
 { "agentMdPath": "" }
@@ -316,6 +418,46 @@ Read any protocol file from a sub-agent's state directory without waiting for co
 
 List all sub-agents registered in the current session with their name, goal, status, and spawn time.
 
+### Supervisor communication
+
+These tools let spawned sessions (Ralph strategist, RLM worker) communicate back to the main conversation at runtime. State is carried in `.opencode/pending_input.json` for question/response pairs and `SUPERVISOR_LOG.md` for the progress feed.
+
+#### `ralph_report(message, level?, post_to_conversation?)`
+
+Fire-and-forget progress report. Appends a timestamped entry to `SUPERVISOR_LOG.md`, shows a toast, and optionally posts into the main conversation so you can see what's happening without opening a separate session.
+
+```
+args:
+  message              string   required  Progress message
+  level                string   optional  "info" | "warning" | "error" (default: "info")
+  post_to_conversation boolean  optional  Post to main conversation (default: true)
+```
+
+#### `ralph_ask(question, context?, timeout_minutes?)`
+
+Ask a question and **block** until you respond via `ralph_respond()`. The question is written to `.opencode/pending_input.json`, a toast appears in the main session, and the main conversation is prompted with the question ID and response instruction. The calling session polls every 5 seconds.
+
+Use this for decisions that can't be inferred from the protocol files — e.g., "should I rewrite `auth.ts` from scratch or patch the existing implementation?"
+
+```
+args:
+  question         string  required  The question
+  context          string  optional  Additional context for the decision
+  timeout_minutes  number  optional  Minutes to wait before timing out (default: 15)
+```
+
+Returns `{ id, answer }` as JSON once you respond.
+
+#### `ralph_respond(id, answer)`
+
+Respond to a pending question, unblocking the session that called `ralph_ask()`. The `id` is shown in the toast and in the main conversation prompt (format: `ask-NNNN`). If you mistype the ID, the tool returns an error listing all pending unanswered questions with their IDs.
+
+```
+args:
+  id      string  required  Question ID (e.g. "ask-1234567890")
+  answer  string  required  Your answer
+```
+
 
 ## Customising prompts via environment variables
 
@@ -391,7 +533,28 @@ Fill in your `verify.command`, write a goal in `PLAN.md`, and start a session. T
 
 ### Overnight: walk away
 
-Set `maxAttempts` high, write a detailed `PLAN.md`, and close your laptop. Check `NOTES_AND_LEARNINGS.md` and `AGENT_CONTEXT_FOR_NEXT_RALPH.md` in the morning to see what happened.
+Set `maxAttempts` high (25–50), write a detailed `PLAN.md` with a precise definition of done, and close your laptop. The loop will:
+
+1. Make an attempt.
+2. Run verify.
+3. On failure: roll state, spawn Ralph to diagnose and adjust, spawn the next worker.
+4. Repeat until it passes or hits `maxAttempts`.
+
+In the morning, check `SUPERVISOR_LOG.md` for the progress feed, `NOTES_AND_LEARNINGS.md` for what the loop learned, and `AGENT_CONTEXT_FOR_NEXT_RALPH.md` for where it stopped.
+
+### Supervisory check-in
+
+Use `ralph_report` and `ralph_ask` to stay informed and make decisions without micromanaging:
+
+```
+Worker:
+  ralph_report("Finished refactoring auth module. 3 tests failing — all in legacy JWT path.")
+  ralph_ask("The legacy JWT path is only used by the mobile app. Rewrite or remove?")
+  ← blocks until you call ralph_respond("ask-...", "Remove it, mobile app is deprecated")
+  (continues with the answer)
+```
+
+You stay in the loop for decisions that require human judgment. Everything else runs unattended.
 
 ### Parallel decomposition with sub-agents
 
@@ -411,6 +574,8 @@ Parent agent:
 
 Edit `RLM_INSTRUCTIONS.md` to add project-specific playbooks, register MCP tools, or adjust the debug workflow. Changes persist across attempts. Use `ralph_update_rlm_instructions()` from within a session, or edit the file directly.
 
+The instructions file is the primary lever for improving loop performance. If the loop keeps making the same mistake, add a rule. If it keeps following an inefficient path, add a playbook. The Ralph strategist is responsible for updating these instructions between attempts based on what it observes in the failure record.
+
 
 ## Hooks installed
 
@@ -425,6 +590,20 @@ Edit `RLM_INSTRUCTIONS.md` to add project-specific playbooks, register MCP tools
 
 ## Background
 
-The Ralph loop is named after the [Ralph Wiggum technique](https://www.geoffreyhuntley.com/ralph) — a `while` loop that feeds a prompt to an AI agent until it succeeds. The name reflects the philosophy: persistent, not clever.
+### The Ralph loop
 
-The RLM inner loop is based on [Recursive Language Models (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601), which shows that keeping large inputs in an external environment and having the model grep/slice/recurse over them significantly outperforms shoving everything into the context window. This plugin approximates that approach with files and custom tools instead of a Python REPL.
+The outer loop is named after the [Ralph Wiggum technique](https://www.geoffreyhuntley.com/ralph) — a `while` loop that feeds a prompt to an AI agent until it succeeds. The name reflects the philosophy: persistent, not clever. The loop doesn't try to be smart about when to give up. It tries, records what happened, and tries again with better instructions.
+
+The key addition in this plugin over a naive Ralph implementation is the **separation of the strategist from the worker**. A naive loop re-prompts the same session. This plugin spawns a fresh Ralph strategist to review the failure before spawning the next worker. The strategist's fresh context means it analyses the failure without being anchored to the reasoning that produced it.
+
+### The RLM inner loop
+
+The worker discipline is based on [Recursive Language Models (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601). The paper's core finding: keeping large inputs in an external environment and having the model grep/slice/recurse over them significantly outperforms shoving everything into the context window at once. Models reason better when they can retrieve exactly what they need rather than filtering signal from a noisy dump.
+
+This plugin approximates that approach using the filesystem as the external environment and `rlm_grep` + `rlm_slice` as the retrieval primitives. `CONTEXT_FOR_RLM.md` is the designated large-reference file — paste API docs, database schemas, or reference code there and the worker accesses it surgically rather than reading it whole.
+
+### On the verify contract
+
+The loop's correctness guarantee is only as strong as `verify.command`. This is a feature, not a limitation. It forces clarity about what "done" means before the loop starts. Ambiguous acceptance criteria produce ambiguous results regardless of how many attempts you give the loop.
+
+The practical recommendation: make your verify command as strict as you can tolerate. If you would normally merge a PR that passes tests + typecheck + lint, configure that as your verify command. The loop will produce code that meets that bar.

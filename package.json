@@ -30,6 +30,10 @@
     "rlm",
     "recursive-language-model"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/doeixd/opencode-ralph-rlm"
+  },
   "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
