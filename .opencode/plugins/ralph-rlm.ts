@@ -3208,7 +3208,6 @@ export const RalphRLM: Plugin = async ({ client, $, worktree }) => {
 
     const cfg = await run(getConfig());
     if (!cfg.enabled) return;
-    if (!cfg.autoStartOnMainIdle) return;
 
     const workerState = sessionMap.get(workerSessionId);
     supervisor.currentWorkerSessionId = undefined;
