@@ -1,5 +1,5 @@
 > [!NOTE]
-> This is an expirement that didnt quite work out. I think this is best as a layer above opencode, and not as a plugin. But feel free to try or fork.
+> This is an experiment that didnt quite work out. I think this is best as a layer above opencode, and not as a plugin. But feel free to try or fork.
 
 # ralph-rlm
 
