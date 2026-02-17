@@ -1,3 +1,6 @@
+> [!NOTE]
+> This is an expirement that didnt quite work out. I think this is best as a layer above opencode, and not as a plugin. But feel free to try or fork.
+
 # ralph-rlm
 
 An [OpenCode](https://opencode.ai) plugin that turns an AI coding session into a persistent, self-correcting loop. Describe a goal, walk away, and come back to working code.
